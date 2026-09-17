@@ -246,6 +246,13 @@ const (
 	// 让账号长时间离池。wb2api 生产实测（单日 680 次命中）显示拦截多为突发，
 	// 60s 后通常已恢复。
 	wafCooldownBase = 60 * time.Second
+
+	// accountFaultCooldown 账号级授权/配额故障的冷却时长。
+	//
+	// 适用 11140 request illegal / 14017 trial 未激活这类由账号自身状态决定的错误：
+	// 短冷却后仍会复现，但**不删凭据**（可能是临时风控，且删了需人工重新登录）。
+	// 取 10 分钟——比 WAF 软冷却长（账号级问题恢复更慢），比硬冷却短（不是余额耗尽）。
+	accountFaultCooldown = 10 * time.Minute
 )
 
 type modelRuntimeState struct {
@@ -1166,6 +1173,222 @@ func clearDisabledMarker(path string) {
 // 业务响应保守处理——宁漏判 WAF 也不误罚业务 403（后者有各自的权威分类）。
 func hasBusinessEnvelope(body string) bool {
 	return strings.Contains(body, `"code":`) || strings.Contains(body, `"msg":`)
+}
+
+// errKind 上游错误的权威分类。调度层据此决定「罚谁」：
+//
+//	账号的问题 → 冷却/禁用该账号，换号重试
+//	请求的问题 → 不罚账号，直接透传（换任何账号都会得到同样结果）
+//
+// 移植自 wb2api 的 ErrKind，按 wbgw 的调度语义裁剪：只保留影响调度决策的
+// 分类，观测类（如 ErrServer 细分）合并。
+type errKind int
+
+const (
+	errNone          errKind = iota // 成功 / 未分类
+	errWafBlock                     // 403 + 无业务信封：IP 级风控，账号健康 → 软冷却
+	errSessionDead                  // 401 / 12153 offline session：真授权失效 → 禁用
+	errAccountFault                 // 11140 request illegal / 14017 trial：账号级故障 → 冷却轮换
+	errHardCredit                   // 402 / 14018 余额耗尽 → 硬冷却至次日
+	errSoftRate                     // 429 / 限流文案 → 对齐上游重置时间
+	errModelBlocked                 // 6004 模型级限流 / 11102 无此模型 → 只冷却该模型
+	errNotFound                     // 404 上游偶发 → 短冷却
+	errServer                       // 5xx 上游故障 → 换号
+	errContentBlocked               // 400 + 审核文案：请求问题，不罚账号
+	errBadParams                    // 400 + 11101 解析失败：请求问题，不罚账号
+	errPromptTooLong                // 11115 上下文超限：请求问题，不罚账号且不轮转
+	errClient                       // 其他 4xx：换号（不同账号模型权限可能不同）
+)
+
+func (k errKind) String() string {
+	switch k {
+	case errWafBlock:
+		return "waf_block"
+	case errSessionDead:
+		return "session_dead"
+	case errAccountFault:
+		return "account_fault"
+	case errHardCredit:
+		return "hard_credit"
+	case errSoftRate:
+		return "soft_rate"
+	case errModelBlocked:
+		return "model_blocked"
+	case errNotFound:
+		return "not_found"
+	case errServer:
+		return "server"
+	case errContentBlocked:
+		return "content_blocked"
+	case errBadParams:
+		return "bad_params"
+	case errPromptTooLong:
+		return "prompt_too_long"
+	case errClient:
+		return "client"
+	default:
+		return "none"
+	}
+}
+
+// punishesAccount 报告该分类是否应归咎于账号（冷却/禁用）。
+// 请求级错误（内容审核、参数畸形、上下文超限）换任何账号都会复现，
+// 罚账号只会白白消耗健康号的可用性。
+func (k errKind) punishesAccount() bool {
+	switch k {
+	case errContentBlocked, errBadParams, errPromptTooLong:
+		return false
+	default:
+		return true
+	}
+}
+
+// rotatesAccount 报告该分类是否值得换号重试。
+// promptTooLong 例外：同一 body 换任何账号都超限，轮转纯属浪费。
+func (k errKind) rotatesAccount() bool {
+	return k != errPromptTooLong
+}
+
+// containsAnyFold 报告 body 是否含任一子串（大小写不敏感）。
+func containsAnyFold(body string, patterns ...string) bool {
+	low := strings.ToLower(body)
+	for _, p := range patterns {
+		if strings.Contains(low, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isContentBlocked 内容策略拦截：HTTP 400 + 审核文案。
+//
+// 上游按逐字指纹审核，客户端注入的模板句（Claude Code / Codex 的 system 指令）
+// 会触发此类拦截。这是误报——账号余额健康、未限流、session 未死，属请求问题。
+func isContentBlocked(statusCode int, body string) bool {
+	if statusCode < 400 {
+		return false
+	}
+	return containsAnyFold(body,
+		"blocked by security policy",
+		"unapproved channel",
+		"illegal api invocation",
+	)
+}
+
+// isBadParams 请求体解析失败（HTTP 400 + code 11101）。
+// 发给上游的 body 有问题，换账号照样 400。
+func isBadParams(statusCode int, body string) bool {
+	if statusCode < 400 {
+		return false
+	}
+	return containsAnyFold(body, "Unmarshal chat params failed") ||
+		strings.Contains(body, `"code":11101`)
+}
+
+// isPromptTooLong 上下文超限（code 11115 / "prompt is too long"）。
+// 只在请求级 4xx 上判定：429 属限流语义优先，5xx 属服务端故障优先。
+func isPromptTooLong(statusCode int, body string) bool {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusNotFound &&
+		statusCode != http.StatusRequestEntityTooLarge {
+		return false
+	}
+	return strings.Contains(body, `"code":11115`) ||
+		strings.Contains(body, `"code":"11115"`) ||
+		containsAnyFold(body, "prompt is too long")
+}
+
+// isAccountFault 账号级授权/配额故障：这类错误由账号自身状态决定，
+// 不是请求格式、不是临时限流、也不是内容误报——继续重试只会反复撞风控。
+//
+//   - "request illegal"（11140）→ 账号级授权风控，需重新登录
+//   - code 14017 / "trial not activated" → 试用未激活账号
+//
+// 注意 11140 不能按 code 判定：同一 code 也承载模型级限流文案，
+// 那种场景须保持 soft_rate（由 isRateLimited 先行命中）。
+func isAccountFault(body string) bool {
+	return containsAnyFold(body,
+		"request illegal",
+		"trial not activated",
+		"trial version is not yet activated",
+	)
+}
+
+// isSessionDead 会话失效（401 / 12153 offline session not found）。
+func isSessionDead(statusCode int, body string) bool {
+	if statusCode == http.StatusUnauthorized {
+		return true
+	}
+	return containsAnyFold(body, "Offline user session not found") ||
+		strings.Contains(body, "12153")
+}
+
+// isModelNotFound 该后端无此模型（11102），只认 400/404。
+func isModelNotFound(statusCode int, body string) bool {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusNotFound {
+		return false
+	}
+	return strings.Contains(body, `"code":11102`) ||
+		containsAnyFold(body, "service info not found")
+}
+
+// classifyUpstream 是上游错误的权威分类入口。判定顺序即优先级：
+// 越具体的语义越先判，且**保持 wbgw 既有分支链的相对次序**，
+// 新分类只插入到不改变既有判定的位置。
+func classifyUpstream(statusCode int, body string) errKind {
+	// 11102 最先判：它是「模型在后端不存在」的确定性答复，语义最具体。
+	// 若落到 4xx 兜底，坏号会留在池内反复被选中。
+	if isModelNotFound(statusCode, body) {
+		return errModelBlocked
+	}
+	// 以下三层保持原 wbgw 顺序（余额 → 模型级限流 → 账号级限流）。
+	// 注意 isQuotaExhausted 自带 429 判定（要求 14018 code 或具体文案），
+	// 不可像 wb2api 那样把裸 429 提前——那会吞掉 14018 的余额语义。
+	if isQuotaExhausted(statusCode, body) {
+		return errHardCredit
+	}
+	if isModelRateLimited(body) {
+		return errModelBlocked
+	}
+	if isRateLimited(statusCode, body) {
+		return errSoftRate
+	}
+	// WAF 403 先于授权失效（原顺序）：无业务信封的 403 是 IP 级风控，
+	// 落 errSessionDead 会 disableAccount 删凭据。
+	if isWafBlocked(statusCode, body) {
+		return errWafBlock
+	}
+	// 账号级终态：session 失效 / 授权故障。二者都需人工介入才能恢复，
+	// 区别在于是否删除凭据（session_dead 删，account_fault 保留）。
+	if isSessionDead(statusCode, body) {
+		return errSessionDead
+	}
+	if isAccountFault(body) {
+		return errAccountFault
+	}
+	// 授权失效文案（invalid token / 登录已过期等）：原 isAuthFailure 的其余分支。
+	if isAuthFailure(statusCode, body) {
+		return errSessionDead
+	}
+	// 请求级错误先于状态码兜底：这些分类不罚账号，误判代价是白白冷却健康号。
+	if isPromptTooLong(statusCode, body) {
+		return errPromptTooLong
+	}
+	if statusCode == http.StatusNotFound {
+		return errNotFound
+	}
+	if statusCode >= 500 {
+		return errServer
+	}
+	if statusCode >= 400 {
+		if isContentBlocked(statusCode, body) {
+			return errContentBlocked
+		}
+		if isBadParams(statusCode, body) {
+			return errBadParams
+		}
+		return errClient
+	}
+	return errNone
 }
 
 // isWafBlocked 判断 403 响应是否为 WAF 拦截形态。
@@ -2719,6 +2942,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 	var lastRateErr string
 	var lastAuthErr string
+	var lastErr string
 	attempted := make(map[*Account]bool, poolSize)
 	for attempt := 0; attempt < poolSize; attempt++ {
 		acc, selection, err := nextAccountForModel(modelName, attempted)
@@ -2730,6 +2954,9 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			}
 			if lastRateErr != "" {
 				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
+			}
+			if lastErr != "" {
+				msg += " | 最近一次上游错误: " + truncate(lastErr, 200)
 			}
 			log.Printf("[#%d] %s", reqID, msg)
 			recordModelFailure(modelName, "无可用账号")
@@ -2787,7 +3014,19 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
 			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 
-			if isQuotaExhausted(resp.StatusCode, errStr) {
+			kind := classifyUpstream(resp.StatusCode, errStr)
+
+			// 请求级错误（上下文超限）：换任何账号都会得到同样结果，
+			// 轮转纯属浪费健康号配额，直接透传上游原文。
+			if !kind.rotatesAccount() {
+				recordModelFailure(modelName, kind.String())
+				writeOpenAIError(w, resp.StatusCode, "upstream_error",
+					fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+				return nil, nil, nil, false
+			}
+
+			switch kind {
+			case errHardCredit:
 				markModelQuotaBlocked(acc, modelName, errStr)
 				if selection == selectionProbeExhausted {
 					msg := fmt.Sprintf("当前模型 %s 已在余额耗尽账号 %s 上完成受控探测并确认需要付费额度，本次不再探测其他耗尽账号", modelName, acc.Path)
@@ -2798,9 +3037,8 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				}
 				lastRateErr = errStr
 				continue
-			}
 
-			if isModelRateLimited(errStr) {
+			case errModelBlocked:
 				until, ok := parseResetTime(errStr)
 				if !ok {
 					until = time.Now().Add(60 * time.Second)
@@ -2814,9 +3052,8 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				}
 				lastRateErr = errStr
 				continue
-			}
 
-			if isRateLimited(resp.StatusCode, errStr) {
+			case errSoftRate:
 				// 429 频率限制：解析重置时间并屏蔽该账号，交由其他账号代偿
 				until, ok := parseResetTime(errStr)
 				if !ok {
@@ -2825,9 +3062,8 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				markCooldown(acc, until, errStr)
 				lastRateErr = errStr
 				continue // 尝试下一个账号
-			}
 
-			if isWafBlocked(resp.StatusCode, errStr) {
+			case errWafBlock:
 				// WAF 拦截（403 + 无业务信封：HTML 拦截页/空体）：拦的是出口 IP
 				// 而非账号，账号本身健康。软冷却让本账号避让，轮换到其他账号继续，
 				// **绝不 disableAccount**——那会删除凭据文件（WAF 误判为授权失效）。
@@ -2836,19 +3072,42 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 					reqID, acc.Path, prof.Label, wafCooldownBase)
 				lastRateErr = errStr
 				continue // 尝试下一个账号
-			}
 
-			if isAuthFailure(resp.StatusCode, errStr) {
-				// 授权失效（401 / 403+业务信封 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
-				// 自动改用下一个可用账号，控制台提示用户重新登录
+			case errAccountFault:
+				// 账号级授权/配额故障（11140 request illegal / 14017 trial 未激活）：
+				// 由账号自身状态决定，短冷却后仍会复现，需重新登录才能恢复。
+				// 与 session_dead 的区别：这里不删凭据（可能是临时风控），只冷却轮换。
+				markCooldown(acc, time.Now().Add(accountFaultCooldown), "账号级故障: "+truncate(errStr, 80))
+				log.Printf("[#%d] 账号 %s [%s] 账号级故障 (%s)，冷却 %v 后轮换（凭据保留）",
+					reqID, acc.Path, prof.Label, kind, accountFaultCooldown)
+				lastAuthErr = errStr
+				continue
+
+			case errSessionDead:
+				// 会话失效（401 / 12153）：真授权失效，需重新登录
 				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d): %s", resp.StatusCode, truncate(errStr, 200)))
 				lastAuthErr = errStr
 				continue // 尝试下一个账号
-			}
 
-			recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-			writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
-			return nil, nil, nil, false
+			case errContentBlocked, errBadParams:
+				// 请求级错误（内容审核 / body 畸形）：账号健康，不冷却不熔断，
+				// 但仍轮转——不同账号可能有不同的模型权限，值得再试一次。
+				log.Printf("[#%d] 账号 %s [%s] 请求级错误 (%s)，不罚账号但轮转重试",
+					reqID, acc.Path, prof.Label, kind)
+				lastErr = errStr
+				continue
+
+			case errNotFound, errServer, errClient:
+				// 上游偶发 / 服务端故障 / 其他 4xx：换号重试（默认行为）
+				recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+				lastErr = errStr
+				continue
+
+			default:
+				recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+				writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+				return nil, nil, nil, false
+			}
 		}
 
 		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)

@@ -556,6 +556,144 @@ func TestWafAndAuthMutuallyExclusive(t *testing.T) {
 	}
 }
 
+// 验证请求级错误的判定：内容审核 / 参数畸形 / 上下文超限。
+//
+// 这三类的共同语义是「换任何账号都会复现」——账号健康，
+// 罚账号只会白白消耗健康号的可用性。
+func TestRequestLevelErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		check  func(int, string) bool
+		want   bool
+	}{
+		{"内容审核-blocked by security policy", 400,
+			`{"code":11128,"msg":"Your request was blocked by security policy"}`, isContentBlocked, true},
+		{"内容审核-unapproved channel", 400,
+			`{"msg":"unapproved channel"}`, isContentBlocked, true},
+		{"内容审核-illegal api invocation", 400,
+			`{"msg":"illegal api invocation"}`, isContentBlocked, true},
+		{"内容审核-大小写不敏感", 400,
+			`{"msg":"BLOCKED BY SECURITY POLICY"}`, isContentBlocked, true},
+		{"内容审核-普通400不命中", 400,
+			`{"msg":"some other error"}`, isContentBlocked, false},
+		{"内容审核-2xx不判定", 200,
+			`{"msg":"blocked by security policy"}`, isContentBlocked, false},
+
+		{"参数畸形-Unmarshal失败", 400,
+			`{"code":11101,"msg":"Unmarshal chat params failed"}`, isBadParams, true},
+		{"参数畸形-仅code", 400,
+			`{"code":11101}`, isBadParams, true},
+		{"参数畸形-其他400", 400,
+			`{"code":12345}`, isBadParams, false},
+
+		{"超限-11115", 400,
+			`{"code":11115,"msg":"prompt is too long"}`, isPromptTooLong, true},
+		{"超限-字符串code", 400,
+			`{"code":"11115"}`, isPromptTooLong, true},
+		{"超限-仅文案", 413,
+			`{"msg":"Prompt is too long"}`, isPromptTooLong, true},
+		{"超限-429不判定", 429,
+			`{"code":11115}`, isPromptTooLong, false},
+		{"超限-5xx不判定", 500,
+			`{"code":11115}`, isPromptTooLong, false},
+	}
+	for _, c := range cases {
+		if got := c.check(c.status, c.body); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// 验证账号级故障判定（11140 request illegal / 14017 trial 未激活）。
+func TestIsAccountFault(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"code":11140,"msg":"request illegal"}`, true},
+		{`{"code":11140,"msg":"Request Illegal"}`, true},
+		{`{"code":14017,"msg":"trial not activated"}`, true},
+		{`{"msg":"The trial version is not yet activated"}`, true},
+		// 11140 也承载模型级限流文案，不能按 code 判为账号故障
+		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
+		{`{"code":6004,"msg":"频率限制"}`, false},
+	}
+	for _, c := range cases {
+		if got := isAccountFault(c.body); got != c.want {
+			t.Errorf("isAccountFault(%q) = %v, want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// 验证 classifyUpstream 的判定优先级与调度语义。
+//
+// 关键不变量：
+//  1. 请求级错误不罚账号（punishesAccount=false）
+//  2. promptTooLong 不轮转（换任何账号都会超限）
+//  3. WAF 与 session_dead 分离（前者保留凭据，后者删除）
+func TestClassifyUpstream(t *testing.T) {
+	wafHTML := `<!DOCTYPE html><title>WAF Block Page</title>`
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   errKind
+	}{
+		{"WAF拦截页", 403, wafHTML, errWafBlock},
+		{"WAF空体", 403, "", errWafBlock},
+		{"401会话失效", 401, `{}`, errSessionDead},
+		{"12153离线会话", 400, `{"code":12153,"msg":"Offline user session not found"}`, errSessionDead},
+		{"invalid token文案", 400, `{"msg":"invalid token"}`, errSessionDead},
+		{"11140账号故障", 403, `{"code":11140,"msg":"request illegal"}`, errAccountFault},
+		{"14018余额耗尽", 429, `{"code":14018,"msg":"额度已用尽"}`, errHardCredit},
+		{"14018非429", 400, `{"code":14018,"msg":"Credits exhausted"}`, errHardCredit},
+		{"6004模型级限流", 400, `{"code":6004,"msg":"切换其他模型"}`, errModelBlocked},
+		{"429账号级限流", 429, `{"msg":"频率限制"}`, errSoftRate},
+		{"11102模型不存在", 400, `{"code":11102,"msg":"service info not found"}`, errModelBlocked},
+		{"11115上下文超限", 400, `{"code":11115,"msg":"prompt is too long"}`, errPromptTooLong},
+		{"内容审核", 400, `{"msg":"blocked by security policy"}`, errContentBlocked},
+		{"参数畸形", 400, `{"code":11101,"msg":"Unmarshal chat params failed"}`, errBadParams},
+		{"404偶发", 404, `{}`, errNotFound},
+		{"500服务端", 500, `{}`, errServer},
+		{"其他4xx", 400, `{"msg":"unknown"}`, errClient},
+		{"200成功", 200, `{}`, errNone},
+	}
+	for _, c := range cases {
+		if got := classifyUpstream(c.status, c.body); got != c.want {
+			t.Errorf("%s: classifyUpstream(%d, %q) = %v, want %v",
+				c.name, c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// 验证调度语义：请求级错误不罚账号，promptTooLong 不轮转。
+func TestErrKindDispatchSemantics(t *testing.T) {
+	// 不罚账号的分类：请求的问题，换账号照样复现
+	for _, k := range []errKind{errContentBlocked, errBadParams, errPromptTooLong} {
+		if k.punishesAccount() {
+			t.Errorf("%v 不应罚账号", k)
+		}
+	}
+	// 其余分类都归咎账号（冷却或禁用）
+	for _, k := range []errKind{errWafBlock, errSessionDead, errAccountFault, errHardCredit,
+		errSoftRate, errModelBlocked, errNotFound, errServer, errClient} {
+		if !k.punishesAccount() {
+			t.Errorf("%v 应罚账号", k)
+		}
+	}
+	// 只有 promptTooLong 不轮转
+	if errPromptTooLong.rotatesAccount() {
+		t.Error("promptTooLong 不应轮转")
+	}
+	for _, k := range []errKind{errWafBlock, errSessionDead, errContentBlocked, errClient} {
+		if !k.rotatesAccount() {
+			t.Errorf("%v 应轮转", k)
+		}
+	}
+}
+
 // 验证轮询跳过已失效（Disabled）账号
 func TestNextAccountSkipsDisabled(t *testing.T) {
 	accountMu.Lock()
