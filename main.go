@@ -234,6 +234,18 @@ const (
 	// modelFreeMinTokens 判定“免费模型”所需的最小样本：上游对极小请求也可能记
 	// credit=0（例如探针请求），那不是真正的免费，不能据此让零余额账号请求收费模型。
 	modelFreeMinTokens = 100
+
+	// wafCooldownBase WAF 403 拦截的账号软冷却时长。
+	//
+	// 与 429 频率限制的冷却语义区分：WAF 拦的是出口 IP 而非账号（多账号在同一
+	// 出口 IP 上会一起中招），账号本身健康。软冷却让该账号先避让，轮换到其他
+	// 账号继续服务；**绝不 disableAccount**——那会删除凭据文件，把 IP 级风控
+	// 误判成需要重新登录的授权失效。
+	//
+	// 取值对齐 wb2api 的 wafCooldownBase（60s）：足够让上游频控窗口滑过，又不至于
+	// 让账号长时间离池。wb2api 生产实测（单日 680 次命中）显示拦截多为突发，
+	// 60s 后通常已恢复。
+	wafCooldownBase = 60 * time.Second
 )
 
 type modelRuntimeState struct {
@@ -1148,10 +1160,39 @@ func clearDisabledMarker(path string) {
 	}
 }
 
+// hasBusinessEnvelope 报告响应体是否带上游业务信封（含 `"code":` 或 `"msg":`）。
+//
+// 不做 JSON 解析：信封存在性只需字段名命中。畸形 JSON 但含 `"msg":` 字样仍按
+// 业务响应保守处理——宁漏判 WAF 也不误罚业务 403（后者有各自的权威分类）。
+func hasBusinessEnvelope(body string) bool {
+	return strings.Contains(body, `"code":`) || strings.Contains(body, `"msg":`)
+}
+
+// isWafBlocked 判断 403 响应是否为 WAF 拦截形态。
+//
+// 判定口径（移植自 wb2api 的 IsWafBlocked）：HTTP 403 且 body 无业务信封。
+// APISIX WAF 拦截页返回 HTML（`<!DOCTYPE html>...<title>WAF Block Page</title>`）、
+// 空体或纯文本，三者均命中；带业务信封的 403（如 11140 request illegal、
+// 11128 内容拦截）仍走 isAuthFailure 的既有文案判定，不受影响。
+//
+// 为什么必须与授权失效分开：WAF 拦的是出口 IP 而非账号，账号本身健康。
+// 若按授权失效处理会 disableAccount → os.Remove(凭据文件)，把有效期数月甚至
+// 一年的凭据直接删掉，且需人工重新扫码登录才能恢复。
+func isWafBlocked(statusCode int, body string) bool {
+	return statusCode == http.StatusForbidden && !hasBusinessEnvelope(body)
+}
+
 // isAuthFailure 判断上游响应是否为授权失效（401/403 / invalid token / 登录过期等）。
+//
+// 403 的处理已收窄：仅当 body 带业务信封且命中失效文案时才算授权失效；
+// 无信封的 403（WAF 拦截页/空体）由 isWafBlocked 单独识别，不在此列。
 func isAuthFailure(statusCode int, body string) bool {
-	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+	if statusCode == http.StatusUnauthorized {
 		return true
+	}
+	if statusCode == http.StatusForbidden && !hasBusinessEnvelope(body) {
+		// WAF 拦截形态：不是授权失效（见 isWafBlocked）。
+		return false
 	}
 	low := strings.ToLower(body)
 	if strings.Contains(low, "invalid token") ||
@@ -1322,6 +1363,12 @@ func doRefreshTokenFor(acc *Account) error {
 		log.Printf("[Auth] 账号 %s Token 刷新失败，HTTP=%d，原因=%v，旧凭据未覆盖", path, status, err)
 		if isAuthFailure(status, err.Error()) {
 			disableAccount(acc, fmt.Sprintf("令牌刷新失败 (HTTP %d): %v", status, err))
+		} else if isWafBlocked(status, err.Error()) {
+			// WAF 拦截 refresh 端点：同样是 IP 级风控，账号凭据有效。
+			// 只软冷却，不删凭据文件（删了就需人工重新登录）。
+			markCooldown(acc, time.Now().Add(wafCooldownBase), "WAF 拦截 (HTTP 403, refresh)")
+			log.Printf("[Auth] 账号 %s Token 刷新被 WAF 拦截，软冷却 %v（未禁用账号，凭据保留）",
+				path, wafCooldownBase)
 		}
 		return err
 	}
@@ -2780,8 +2827,19 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				continue // 尝试下一个账号
 			}
 
+			if isWafBlocked(resp.StatusCode, errStr) {
+				// WAF 拦截（403 + 无业务信封：HTML 拦截页/空体）：拦的是出口 IP
+				// 而非账号，账号本身健康。软冷却让本账号避让，轮换到其他账号继续，
+				// **绝不 disableAccount**——那会删除凭据文件（WAF 误判为授权失效）。
+				markCooldown(acc, time.Now().Add(wafCooldownBase), "WAF 拦截 (HTTP 403)")
+				log.Printf("[#%d] 账号 %s [%s] 命中 WAF 拦截，软冷却 %v 后重试（未禁用账号）",
+					reqID, acc.Path, prof.Label, wafCooldownBase)
+				lastRateErr = errStr
+				continue // 尝试下一个账号
+			}
+
 			if isAuthFailure(resp.StatusCode, errStr) {
-				// 授权失效（401/403 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
+				// 授权失效（401 / 403+业务信封 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
 				// 自动改用下一个可用账号，控制台提示用户重新登录
 				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d): %s", resp.StatusCode, truncate(errStr, 200)))
 				lastAuthErr = errStr

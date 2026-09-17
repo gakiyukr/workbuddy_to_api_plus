@@ -479,7 +479,10 @@ func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
 	}
 }
 
-// 验证授权失效识别（401/403 / invalid token / 登录过期等）
+// 验证授权失效识别（401 / 403+业务信封 / invalid token / 登录过期等）。
+//
+// 403 的语义已拆分：无业务信封的 403（WAF 拦截页/空体）不是授权失效，
+// 由 TestIsWafBlocked 覆盖；此处只保留带业务信封的 403。
 func TestIsAuthFailure(t *testing.T) {
 	cases := []struct {
 		status int
@@ -487,7 +490,7 @@ func TestIsAuthFailure(t *testing.T) {
 		want   bool
 	}{
 		{401, "{}", true},
-		{403, "{}", true},
+		{403, `{"code":11140,"msg":"request illegal"}`, false}, // 业务 403 无失效文案
 		{400, `{"msg":"invalid token"}`, true},
 		{400, "unauthorized", true},
 		{400, "登录已过期", true},
@@ -499,6 +502,56 @@ func TestIsAuthFailure(t *testing.T) {
 	for _, c := range cases {
 		if got := isAuthFailure(c.status, c.body); got != c.want {
 			t.Errorf("isAuthFailure(%d, %q) = %v, want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// 验证 WAF 拦截识别（403 + 无业务信封）。
+//
+// 回归背景：修复前 isAuthFailure 对任何 403 都返回 true，导致 WAF 拦截页
+// （HTML/空体）被误判为授权失效 → disableAccount → os.Remove(凭据文件)，
+// 把有效期数月的凭据直接删掉。本测试锁定拆分后的语义。
+func TestIsWafBlocked(t *testing.T) {
+	wafHTML := `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" />` +
+		`<title>WAF Block Page</title></head><body></body></html>`
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"403+HTML拦截页", 403, wafHTML, true},
+		{"403+空体", 403, "", true},
+		{"403+纯文本", 403, "Forbidden", true},
+		{"403+业务信封", 403, `{"code":11140,"msg":"request illegal"}`, false},
+		{"403+仅msg字段", 403, `{"msg":"内容包含敏感信息"}`, false},
+		{"401不是WAF", 401, wafHTML, false},
+		{"429不是WAF", 429, "频率限制", false},
+		{"200不是WAF", 200, wafHTML, false},
+	}
+	for _, c := range cases {
+		if got := isWafBlocked(c.status, c.body); got != c.want {
+			t.Errorf("%s: isWafBlocked(%d, %q) = %v, want %v", c.name, c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// 验证 WAF 与授权失效互斥：同一响应不可能同时归入两类。
+func TestWafAndAuthMutuallyExclusive(t *testing.T) {
+	bodies := []string{
+		"",
+		"<!DOCTYPE html><title>WAF Block Page</title>",
+		`{"code":11140,"msg":"request illegal"}`,
+		`{"msg":"invalid token"}`,
+		"unauthorized",
+	}
+	for _, status := range []int{401, 403} {
+		for _, body := range bodies {
+			waf := isWafBlocked(status, body)
+			auth := isAuthFailure(status, body)
+			if waf && auth {
+				t.Errorf("status=%d body=%q 同时命中 WAF 与授权失效", status, body)
+			}
 		}
 	}
 }
