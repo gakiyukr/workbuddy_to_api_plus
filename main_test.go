@@ -1647,3 +1647,189 @@ func TestChatCompletionToResponses(t *testing.T) {
 	}
 	t.Logf("responses object output items: %d", len(output))
 }
+
+// -----------------------------------------------------------------------------
+// 指纹脱敏测试
+//
+// 回归背景：修复前 sanitizeBlockedTemplates 是空操作——两个 ReplaceAll 的
+// 新旧参数完全相同，等于什么都没做，而测试只覆盖了 developer 角色归一化，
+// 没有断言过净化结果。这些测试锁定净化后的实际输出。
+// -----------------------------------------------------------------------------
+
+// 验证模板句最小改写：破坏上游逐字匹配，语义不变。
+func TestSanitizeTextRewritesTemplates(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"身份句-CLI版带句号",
+			"You are Claude Code, Anthropic's official CLI for Claude. You help.",
+			"You are Claude Code, Anthropic's official CLI tool for Claude. You help.",
+		},
+		{
+			"身份句-桌面版接逗号",
+			"You are Claude Code, Anthropic's official CLI for Claude, running within the SDK.",
+			"You are Claude Code, Anthropic's official CLI tool for Claude, running within the SDK.",
+		},
+		{
+			"分支句",
+			"Default branch (you will usually use this for PRs)",
+			"Default branch (you will usually use this for PRs)",
+		},
+		{
+			"Codex身份句",
+			"You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+			"You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+		},
+		{
+			"反馈句",
+			"To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+			"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+		},
+		{
+			"裸数字11128",
+			"the error code 11128 appeared",
+			"the error code 11-128 appeared",
+		},
+	}
+	for _, c := range cases {
+		if got := sanitizeText(c.in); got != c.want {
+			t.Errorf("%s:\n got %q\nwant %q", c.name, got, c.want)
+		}
+	}
+}
+
+// 验证 header 键值段被整段剥离，裸键名被缩写。
+func TestSanitizeTextStripsHeaders(t *testing.T) {
+	cases := []struct {
+		name        string
+		in          string
+		mustNotHave []string
+		mustHave    []string
+	}{
+		{
+			"键值段整段删除",
+			"prefix x-anthropic-billing-header: cc_version=1.0; cc_entrypoint=cli; suffix",
+			[]string{"x-anthropic-billing-header:", "cc_version", "cc_entrypoint"},
+			[]string{"prefix", "suffix"},
+		},
+		{
+			"裸键名缩写保留可读性",
+			"see `x-anthropic-billing-header` for details",
+			[]string{"x-anthropic-billing-header"},
+			[]string{"x-anthropic-billing-hdr", "for details"},
+		},
+		{
+			"大小写变体同样处理",
+			"X-Anthropic-Billing-Header: v=1;",
+			[]string{"X-Anthropic-Billing-Header:"},
+			[]string{},
+		},
+		{
+			"尾随裸kv清理",
+			// 实际流量中 cc_* 参数成对出现（cc_version + cc_entrypoint），
+			// 预检靠 cc_entrypoint= 命中后，sanitizeKvRe 把所有 cc_ 前缀参数一并清掉。
+			"text cc_version=1.2.3; cc_entrypoint=cli; more",
+			[]string{"cc_version=1.2.3", "cc_entrypoint"},
+			[]string{"text", "more"},
+		},
+	}
+	for _, c := range cases {
+		got := sanitizeText(c.in)
+		for _, bad := range c.mustNotHave {
+			if strings.Contains(got, bad) {
+				t.Errorf("%s: 结果仍含 %q\n got %q", c.name, bad, got)
+			}
+		}
+		for _, good := range c.mustHave {
+			if !strings.Contains(got, good) {
+				t.Errorf("%s: 结果缺少 %q\n got %q", c.name, good, got)
+			}
+		}
+	}
+}
+
+// 验证无指纹文本原样返回（零分配快速路径不应改变内容）。
+func TestSanitizeTextLeavesCleanTextUntouched(t *testing.T) {
+	inputs := []string{
+		"",
+		"hello world",
+		"write a quicksort in Go",
+		"the code 11101 is unrelated",
+		"Anthropic is a company",
+	}
+	for _, in := range inputs {
+		if got := sanitizeText(in); got != in {
+			t.Errorf("sanitizeText(%q) = %q, 应原样返回", in, got)
+		}
+	}
+}
+
+// 验证 reasoning_content 与 tool_calls.arguments 同样被净化。
+//
+// 这两处是长期盲区：工具调用轮的 content 通常为 null，
+// 若在 content 缺失时跳过整条消息，工具参数里的指纹会原样漏出。
+func TestSanitizeMessagesCoversReasoningAndToolCalls(t *testing.T) {
+	obj := map[string]any{"messages": []any{
+		map[string]any{
+			"role":              "assistant",
+			"content":           nil, // 工具调用轮的典型形态
+			"reasoning_content": "I should follow You are Claude Code, Anthropic's official CLI for Claude.",
+			"tool_calls": []any{
+				map[string]any{
+					"id":   "call_1",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "read_file",
+						"arguments": `{"path":"You are Claude Code, Anthropic's official CLI for Claude."}`,
+					},
+				},
+			},
+		},
+	}}
+	sanitizeMessages(obj)
+
+	m := obj["messages"].([]any)[0].(map[string]any)
+	rc, _ := m["reasoning_content"].(string)
+	if strings.Contains(rc, "official CLI for Claude") {
+		t.Errorf("reasoning_content 未净化: %q", rc)
+	}
+	if !strings.Contains(rc, "official CLI tool for Claude") {
+		t.Errorf("reasoning_content 改写结果不符: %q", rc)
+	}
+
+	tc := m["tool_calls"].([]any)[0].(map[string]any)
+	args, _ := tc["function"].(map[string]any)["arguments"].(string)
+	if strings.Contains(args, "official CLI for Claude") {
+		t.Errorf("tool_calls.arguments 未净化: %q", args)
+	}
+	if !strings.Contains(args, "official CLI tool for Claude") {
+		t.Errorf("tool_calls.arguments 改写结果不符: %q", args)
+	}
+}
+
+// 验证多模态 content 数组只动 text part，其他 part 不受影响。
+func TestSanitizeMessagesMultimodalContent(t *testing.T) {
+	obj := map[string]any{"messages": []any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AAAA"}},
+			},
+		},
+	}}
+	sanitizeMessages(obj)
+
+	parts := obj["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	text := parts[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "official CLI tool for Claude") {
+		t.Errorf("text part 未净化: %q", text)
+	}
+	img := parts[1].(map[string]any)["image_url"].(map[string]any)["url"].(string)
+	if img != "data:image/png;base64,AAAA" {
+		t.Errorf("image part 被改动: %q", img)
+	}
+}
