@@ -42,7 +42,7 @@
 | `df4556c` | 成本账本分层选号 + 多代理池 | 移植 wb2api 的 costTier 与 issue #136 方案 a′ |
 | `8abcaf3` | CI：推送 tag 自动发布 Linux 产物 | 本仓库新增 |
 | `b58ecea` | 文档：代码来源与 MIT 署名 | 本仓库新增 |
-| 待提交 | `prompt_cache_key` 前缀缓存复用（费用降约 17 倍） | 移植 wb2api 的 `cache_key.go`（MIT） |
+| `1c5bea9` | `prompt_cache_key` 前缀缓存复用（费用降约 17 倍） | 移植 wb2api 的 `cache_key.go`（MIT） |
 
 设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
 
