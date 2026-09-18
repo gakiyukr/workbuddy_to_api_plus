@@ -3441,8 +3441,8 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			// 轮转纯属浪费健康号配额，直接透传上游原文。
 			if !kind.rotatesAccount() {
 				recordModelFailure(modelName, kind.String())
-				writeOpenAIError(w, resp.StatusCode, "upstream_error",
-					fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+				writeOpenAIErrorHint(w, resp.StatusCode, "upstream_error",
+					fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr), kind)
 				return nil, nil, nil, false
 			}
 
@@ -3555,7 +3555,8 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 			default:
 				recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-				writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+				writeOpenAIErrorHint(w, resp.StatusCode, "upstream_error",
+					fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr), kind)
 				return nil, nil, nil, false
 			}
 		}
@@ -3605,6 +3606,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 腾讯上游强制要求 stream 必须为 true，非流式会被拦截 (code 11101)
 	reqObj["stream"] = true
+
+	// OpenAI 新别名翻译：上游只认 max_tokens，直接透传 max_completion_tokens 会 400
+	translateMaxCompletionTokens(reqObj)
 
 	// 深度思考 (Thinking) 自动适配：混元系列如果未关闭思考，自动赋予 high 档位保证深度思考输出
 	applyThinkingRules(reqObj, modelName)
@@ -3688,6 +3692,10 @@ func streamChatResponse(w http.ResponseWriter, resp *http.Response, modelName st
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var usage map[string]any
+	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，供逐 chunk 透传时
+	// 收敛 name 为「每 index 一次」（对齐 OpenAI 官方流，防累加型客户端把工具名拼成
+	// Bash×帧数）。
+	toolCallSeen := map[int]bool{}
 	for scanner.Scan() {
 		cleanData := stripDataPrefix(scanner.Text())
 		if cleanData == "" {
@@ -3702,6 +3710,16 @@ func streamChatResponse(w http.ResponseWriter, resp *http.Response, modelName st
 		if json.Unmarshal([]byte(cleanData), &chunk) == nil {
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usage = u
+			}
+			// 上游 error 帧（带 error 键）原样透传，但附加网关视角的 gateway_hint
+			// 补充说明——message 原文一律不动，hint 并列添加（见 attachHintToErrorFrame）。
+			if _, hasErr := chunk["error"]; hasErr {
+				cleanData = attachHintToErrorFrame(cleanData, frameGatewayHint(cleanData))
+			} else {
+				stripToolCallNames(chunk, toolCallSeen)
+				if raw, err := json.Marshal(chunk); err == nil {
+					cleanData = string(raw)
+				}
 			}
 		}
 		if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
@@ -4874,6 +4892,200 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 //  2. 旧版 function_call 空壳：上游在含工具调用的终止片追加
 //     {"function_call":{"name":"","arguments":""}}，属同类非规范噪声，一并清除。
 //  3. delta 中的空值字段（content:""、tool_calls:[] 等）。
+
+// stripToolCallNames 收敛流式 tool_calls 的 name 语义为「每个 index 只出现一次」：
+// 首片保留 function.name，同一 index 后续分片里的 name 键一律删除（无论上游是
+// 空串还是重复非空串）。
+//
+// 来源：逐字移植自 Sliverkiss/workbuddy2api 的 internal/upstream/sse.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 这是 OpenAI 官方流的真实形态——首帧带 name，后续帧只带 arguments 片段、不再出现
+// name 键——因此是累加型与覆盖型客户端的共同祖先行为：
+//   - 累加型（官方 WorkBuddy/CodeBuddy `name += tc_function?.name || ""`）：
+//     后续分片 name 键缺失 → 追加空串，累积 name 保持唯一，不再拼成 Bash×帧数。
+//   - 覆盖型（`name ?? state.name` 或 `if (name) state.name = name`）：
+//     后续分片 name 键缺失 → 保留已建好的首帧 name，不被空串意外清空。
+//     键缺失是比空串更安全的形态：`??` 与 truthy 守卫对缺失键必然保留旧值，
+//     而对空串，`??` 会误判为重设并清空工具名。
+//
+// seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
+// 只动 function.name 键，id/type/arguments 原样透传。
+func stripToolCallNames(obj map[string]any, seen map[int]bool) {
+	choices, _ := obj["choices"].([]any)
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		delta, _ := c["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		tcs, _ := delta["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			if tc == nil {
+				continue
+			}
+			idx := 0
+			if v, ok := tc["index"].(float64); ok {
+				idx = int(v)
+			}
+			if seen[idx] {
+				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
+				if fn, _ := tc["function"].(map[string]any); fn != nil {
+					delete(fn, "name")
+				}
+				continue
+			}
+			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
+			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
+			seen[idx] = true
+		}
+	}
+}
+
+// translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
+// 认的 max_tokens（OpenAI 新别名，上游只认后者，直接透传会 400 code=11101）。
+//
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/upstream/payload.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 规则：
+//   - 显式 max_tokens 优先——别名只删不译；
+//   - 别名非正数值（0/null/负数）不翻译；
+//   - 非数值别名（字符串等畸形）不翻译（原样透传由上游报 11101 参数错）；
+//   - 无论是否翻译，别名一律删除（上游不认该字段）。
+func translateMaxCompletionTokens(obj map[string]any) {
+	alias, has := obj["max_completion_tokens"]
+	delete(obj, "max_completion_tokens")
+	if !has {
+		return
+	}
+	if _, explicit := obj["max_tokens"]; explicit {
+		return // 显式 max_tokens 优先：别名只删不译
+	}
+	// json.Unmarshal 数字 → float64（整数去整后回写，避免科学计数法/小数尾巴进上游 body）；
+	// 其他数值类型防御性兼容（手构造 map 的调用方）。
+	switch v := alias.(type) {
+	case float64:
+		if v > 0 && v == float64(int64(v)) {
+			obj["max_tokens"] = int64(v)
+		}
+	case int64:
+		if v > 0 {
+			obj["max_tokens"] = v
+		}
+	case int:
+		if v > 0 {
+			obj["max_tokens"] = int64(v)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 网关错误附加说明（error.gateway_hint）
+//
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/upstream/hint.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 纪律：
+//   - error.message 永远是上游 body 原文透传；gateway_hint 只做与 message **并列**的
+//     网关视角补充说明，绝不替换 / 包装 message。
+//   - 未覆盖形态返回空串 → 响应不带该字段（不编造）。
+//   - 措辞是英文：错误响应面向客户端工具链，英文是通用口径。
+// -----------------------------------------------------------------------------
+
+// gatewayHint 按错误分类返回网关视角的补充说明（error.gateway_hint 字段值）。
+// 返回空串 = 未覆盖形态，调用方不带该字段。
+//
+// 措辞面向「客户端下一步该做什么」，而非复述错误：换号无意义的形态提示等待，
+// 请求问题的形态提示调整入参。
+func gatewayHint(kind errKind) string {
+	switch kind {
+	case errPromptTooLong:
+		return "request context exceeds the model's limit; reduce history/message size"
+	case errWafBlock:
+		return "upstream WAF blocked the gateway; retry after the block window"
+	case errSoftRate:
+		return "rate limited by upstream; retry after reset"
+	case errAccountFault:
+		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
+	case errSessionDead:
+		return "account session expired at upstream; the account is disabled until re-login"
+	case errHardCredit:
+		return "account credits exhausted at upstream; waiting for daily check-in to restore"
+	case errModelBlocked:
+		return "upstream has no such model on this backend; switch model or retry on another account"
+	case errContentBlocked:
+		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径。
+		return "request content was rejected by content policy; adjust the prompt and retry"
+	default:
+		// errNone / errNotFound / errServer / errBadParams / errClient 等未覆盖形态：无 hint。
+		return ""
+	}
+}
+
+// writeOpenAIErrorHint 同 writeOpenAIError，但在 error 对象内并列附加 gateway_hint
+// 字段（message 原文不动）。hint 为空串时不带该字段，响应与 writeOpenAIError 逐字节一致。
+func writeOpenAIErrorHint(w http.ResponseWriter, statusCode int, errType, message string, kind errKind) {
+	hint := gatewayHint(kind)
+	if hint == "" {
+		writeOpenAIError(w, statusCode, errType, message)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message":      message,
+			"type":         errType,
+			"code":         statusCode,
+			"gateway_hint": hint,
+		},
+	})
+}
+
+// attachHintToErrorFrame 给上游 SSE error 帧的 error 对象附加 gateway_hint 字段。
+// message / code / requestId 等原文一律不动；非 JSON 或结构不符时原样返回。
+func attachHintToErrorFrame(payload, hint string) string {
+	if hint == "" {
+		return payload
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(payload), &obj) != nil {
+		return payload
+	}
+	errObj, ok := obj["error"].(map[string]any)
+	if !ok {
+		return payload
+	}
+	errObj["gateway_hint"] = hint
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return string(out)
+}
+
+// frameGatewayHint 判定 SSE error 帧的 gateway_hint：帧内 error.message 走既有分类，
+// 命中则返回 hint。非 error 帧 / 判不出 / 未覆盖形态返回空串（原样透传）。
+func frameGatewayHint(payload string) string {
+	if payload == "" || payload == "[DONE]" {
+		return ""
+	}
+	var f struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
+		return ""
+	}
+	return gatewayHint(classifyUpstream(http.StatusBadRequest, f.Error.Message))
+}
+
 func cleanChunkJSON(s string) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {

@@ -60,6 +60,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	chatReq["stream"] = true // 上游强制流式，非流式由网关本地聚合
+	// 别名翻译：Responses API 的 max_output_tokens 已由转译层映射为 max_tokens，
+	// 此处兜底处理客户端直传的 max_completion_tokens 别名。
+	translateMaxCompletionTokens(chatReq)
 
 	applyThinkingRules(chatReq, modelName)
 	sanitizeMessages(chatReq)

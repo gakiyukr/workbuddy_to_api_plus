@@ -45,6 +45,7 @@
 | `1c5bea9` | `prompt_cache_key` 前缀缓存复用（费用降约 17 倍） | 移植 wb2api 的 `cache_key.go`（MIT） |
 | `8d7e1d8` | tool 配对自愈（孤儿清理 + 结果块重排） | 移植 wb2api 的 `tool_pairing.go`（MIT） |
 | `0dcefa0` | 残缺工具参数检测 + 轮转退避与抖动 | 移植 wb2api 的 `truncation.go` / `backoff.go`（MIT） |
+| 待提交 | 流式工具名收敛 + 别名翻译 + `gateway_hint` | 移植 wb2api 的 `sse.go` / `payload.go` / `hint.go`（MIT） |
 
 设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
 
@@ -80,6 +81,9 @@
 | `jitterDur` | `internal/server/backoff.go` | 94.0%（常量改可注入变量以便测试） |
 | `rotateBackoffDelay` | 同上（原名 `backoffAfter`） | 94.4%（改名 + 常量改可注入变量） |
 | `sleepCtx` | 同上 | 逐字相同 |
+| `stripToolCallNames` | `internal/upstream/sse.go` | 逐字相同（含注释） |
+| `translateMaxCompletionTokens` | `internal/upstream/payload.go` | 逐字相同（含注释） |
+| `gatewayHint` / `attachHintToErrorFrame` / `frameGatewayHint` | `internal/upstream/hint.go` | 按设计思路适配（合并 `FrameKind` 与 `GatewayHint` 为单一入口、裁剪 11133/11135 图片形态判定——本仓库无模型能力目录） |
 
 其余移植项（`errKind` 分类体系、成本分层选号、会话头族、内容拦截降级、多代理池）
 为**按设计思路的裁剪重实现**，非逐字复制：结构对齐 wb2api 的调度语义，
@@ -198,6 +202,9 @@
 - ✦ **tool 配对自愈**：出站前对 `messages` 做两步归一化——**重排**（把夹在 tool 结果中间的非 tool 消息挪到整组之后）与**清理**（按 id 对称剔除无结果的 `tool_call` 与无调用的 `tool` 结果）。工具执行失败时客户端会把 `tool_calls` 写进历史却写不回结果，这条坏历史每次重放都让上游返回 400（`11148`）**顶死整条会话**；Codex 的 `image_resize_notice` 插在并行结果中间同样判配对断裂。网关是最后一道防线：宁可丢一轮工具上下文，也好过会话报废。（移植 wb2api 的 `tool_pairing.go`）
 - ✦ **残缺工具参数检测**：流被截断时（`finish_reason=="length"` 模型因 max_tokens 中止，或上游连接中断未发 `[DONE]`）工具调用的 `arguments` 会只剩半截 JSON，原样下发会让客户端解析失败**卡死会话**。判定口径只认「非空但无法解析」——空串是合法的无参工具、能解析的标量/数组属模型输出错误，都不在此列；命中则丢弃该调用（不补成 `{}` 伪造合法外观）。（移植 wb2api 的 `truncation.go`）
 - ✦ **轮转退避与抖动**：换号重试前等待 `500ms·2^n`（封顶 8s）并施加 ±25% 抖动，让上游频控窗口滑过。立即连环重试会以固定节奏持续撞击 WAF 的密度判罚；抖动打散多请求的同相位重试（齐步走的退避会以固定周期再次聚团）。首次尝试零开销，`ctx` 取消（客户端断连/停机）立即终止轮转。（移植 wb2api 的 `backoff.go`）
+- ✦ **流式工具名收敛**：上游在**每一帧**重复下发 `tool_calls[].function.name`，累加型客户端（`name += ...`）会把工具名拼成 `BashBashBash` 导致工具调用失败。网关按 index 只保留首片的 `name` 键，后续分片删除该键——这是 OpenAI 官方流的真实形态，累加型（追加空串）与覆盖型（`??` 守卫保留旧值）客户端同时正确。（移植 wb2api 的 `stripToolCallNames`）
+- ✦ **`max_completion_tokens` 别名翻译**：OpenAI 新别名，上游只认 `max_tokens`，直接透传会 400（`11101`）。显式 `max_tokens` 优先（别名只删不译）、非正值与畸形值不翻译，别名一律删除。（移植 wb2api 的 `translateMaxCompletionTokens`）
+- ✦ **`error.gateway_hint` 附加说明**：错误响应中在 `error` 对象内**并列**附加网关视角的可操作说明（如「上下文超限，请减少历史」「WAF 拦截，等窗口过去再试」），`message` 永远是上游原文透传、绝不替换包装；未覆盖的错误形态不带该字段（不编造）。流式 error 帧同样附加。（移植 wb2api 的 `hint.go`）
 - **国内站每日自动签到**：服务启动、凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；国际站跳过。
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
 - **授权失效自动禁用**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复；**WAF 形态的 403 不在此列**。

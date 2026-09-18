@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2467,6 +2468,327 @@ func TestRotationBackoffAppliedBetweenAttempts(t *testing.T) {
 	// base=40ms、n=0 → 40ms ±25% = [30ms, 50ms]；放宽下界吸收调度抖动
 	if gap < 25*time.Millisecond {
 		t.Fatalf("两次尝试间隔 %v，退避未生效（期望 ≥25ms）", gap)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// gateway_hint 测试
+// -----------------------------------------------------------------------------
+
+// 验证 hint 映射：覆盖形态给出可操作说明，未覆盖形态返回空串（不编造）。
+func TestGatewayHintMapping(t *testing.T) {
+	cases := []struct {
+		kind     errKind
+		wantSome bool
+	}{
+		{errPromptTooLong, true},
+		{errWafBlock, true},
+		{errSoftRate, true},
+		{errAccountFault, true},
+		{errSessionDead, true},
+		{errHardCredit, true},
+		{errModelBlocked, true},
+		{errContentBlocked, true},
+		// 未覆盖形态：无 hint
+		{errNone, false},
+		{errNotFound, false},
+		{errServer, false},
+		{errBadParams, false},
+		{errClient, false},
+	}
+	for _, c := range cases {
+		got := gatewayHint(c.kind)
+		if c.wantSome && got == "" {
+			t.Errorf("%v 应有 hint", c.kind)
+		}
+		if !c.wantSome && got != "" {
+			t.Errorf("%v 不应有 hint，实际 %q", c.kind, got)
+		}
+	}
+	// content_blocked 的措辞约定：不含 "upstream"（既有口径）
+	if h := gatewayHint(errContentBlocked); strings.Contains(h, "upstream") {
+		t.Errorf("content_blocked hint 不应含 upstream: %q", h)
+	}
+}
+
+// 验证 writeOpenAIErrorHint：message 原文不动，hint 并列附加；未覆盖形态与
+// writeOpenAIError 输出一致（不带 gateway_hint 字段）。
+func TestWriteOpenAIErrorHintPreservesMessage(t *testing.T) {
+	const upstreamMsg = "upstream 400: {\"code\":11115,\"msg\":\"prompt is too long\"}"
+
+	rec := httptest.NewRecorder()
+	writeOpenAIErrorHint(rec, http.StatusBadRequest, "upstream_error", upstreamMsg, errPromptTooLong)
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	errObj := body["error"].(map[string]any)
+	if errObj["message"] != upstreamMsg {
+		t.Fatalf("message 必须是上游原文: %q", errObj["message"])
+	}
+	if errObj["gateway_hint"] == "" || errObj["gateway_hint"] == nil {
+		t.Fatal("应附加 gateway_hint")
+	}
+	if errObj["type"] != "upstream_error" {
+		t.Fatalf("type 不应被改动: %v", errObj["type"])
+	}
+
+	// 未覆盖形态：不带 gateway_hint 字段
+	rec2 := httptest.NewRecorder()
+	writeOpenAIErrorHint(rec2, http.StatusNotFound, "upstream_error", "not found", errNotFound)
+	var body2 map[string]any
+	_ = json.Unmarshal(rec2.Body.Bytes(), &body2)
+	if _, ok := body2["error"].(map[string]any)["gateway_hint"]; ok {
+		t.Fatal("未覆盖形态不应带 gateway_hint")
+	}
+}
+
+// 验证 SSE error 帧附加 hint：error 内其余字段原样，非 error 帧不动。
+func TestAttachHintToErrorFrame(t *testing.T) {
+	frame := `{"error":{"message":"prompt is too long","code":11115,"requestId":"req-1"}}`
+	out := attachHintToErrorFrame(frame, "reduce history")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	errObj := obj["error"].(map[string]any)
+	if errObj["message"] != "prompt is too long" || errObj["code"] != float64(11115) || errObj["requestId"] != "req-1" {
+		t.Fatalf("error 原文被改动: %#v", errObj)
+	}
+	if errObj["gateway_hint"] != "reduce history" {
+		t.Fatalf("hint 未附加: %#v", errObj)
+	}
+	// hint 为空 → 原样返回
+	if got := attachHintToErrorFrame(frame, ""); got != frame {
+		t.Fatal("空 hint 应原样返回")
+	}
+	// 非 JSON / 无 error 键 → 原样返回
+	if got := attachHintToErrorFrame("not json", "x"); got != "not json" {
+		t.Fatal("非 JSON 应原样返回")
+	}
+	if got := attachHintToErrorFrame(`{"choices":[]}`, "x"); got != `{"choices":[]}` {
+		t.Fatal("无 error 键应原样返回")
+	}
+}
+
+// 验证 frameGatewayHint 从帧内 error.message 走既有分类。
+func TestFrameGatewayHint(t *testing.T) {
+	// 上下文超限 → 有 hint
+	if h := frameGatewayHint(`{"error":{"message":"prompt is too long"}}`); h == "" {
+		t.Fatal("上下文超限帧应有 hint")
+	}
+	// 未覆盖形态 → 无 hint
+	if h := frameGatewayHint(`{"error":{"message":"some unknown failure"}}`); h != "" {
+		t.Fatalf("未覆盖形态不应有 hint: %q", h)
+	}
+	// 非 error 帧 / [DONE] → 无 hint
+	if h := frameGatewayHint(`{"choices":[{"delta":{"content":"hi"}}]}`); h != "" {
+		t.Fatal("普通数据帧不应有 hint")
+	}
+	if h := frameGatewayHint("[DONE]"); h != "" {
+		t.Fatal("[DONE] 不应有 hint")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 流式 tool_calls name 收敛测试
+// -----------------------------------------------------------------------------
+
+// 验证 stripToolCallNames：每个 index 只有首片保留 name，后续分片删 name 键。
+// 这是累加型客户端把工具名拼成 "BashBashBash" 的根因修复。
+func TestStripToolCallNamesKeepsFirstOnly(t *testing.T) {
+	seen := map[int]bool{}
+	// 首片：带 name
+	first := map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+		"tool_calls": []any{map[string]any{"index": float64(0), "id": "c1",
+			"function": map[string]any{"name": "Bash", "arguments": ""}}},
+	}}}}
+	stripToolCallNames(first, seen)
+	fn := first["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "Bash" {
+		t.Fatalf("首片应保留 name: %#v", fn)
+	}
+
+	// 后续分片：上游重复下发 name → 必须删除
+	second := map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+		"tool_calls": []any{map[string]any{"index": float64(0),
+			"function": map[string]any{"name": "Bash", "arguments": "{\"cmd\""}}},
+	}}}}
+	stripToolCallNames(second, seen)
+	fn2 := second["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if _, ok := fn2["name"]; ok {
+		t.Fatalf("后续分片必须删除 name 键（累加型客户端会拼成 BashBash）: %#v", fn2)
+	}
+	if fn2["arguments"] != "{\"cmd\"" {
+		t.Fatalf("arguments 不应被改动: %#v", fn2)
+	}
+}
+
+// 验证多 index 各自独立计数：index 0 已见不影响 index 1 的首片。
+func TestStripToolCallNamesPerIndex(t *testing.T) {
+	seen := map[int]bool{}
+	stripToolCallNames(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+		"tool_calls": []any{map[string]any{"index": float64(0), "function": map[string]any{"name": "A"}}},
+	}}}}, seen)
+	// index 1 首现：保留 name
+	frame := map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+		"tool_calls": []any{map[string]any{"index": float64(1), "function": map[string]any{"name": "B"}}},
+	}}}}
+	stripToolCallNames(frame, seen)
+	fn := frame["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "B" {
+		t.Fatalf("不同 index 应各自保留首片 name: %#v", fn)
+	}
+}
+
+// 验证无 index 字段时按 0 处理（与上游缺省行为一致），且删除幂等。
+func TestStripToolCallNamesMissingIndexAndIdempotent(t *testing.T) {
+	seen := map[int]bool{}
+	frame := map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+		"tool_calls": []any{map[string]any{"function": map[string]any{"name": "X"}}},
+	}}}}
+	stripToolCallNames(frame, seen) // 首现：保留
+	fn := frame["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "X" {
+		t.Fatal("缺 index 时首现应保留 name")
+	}
+	stripToolCallNames(frame, seen) // 再次：删除
+	if _, ok := fn["name"]; ok {
+		t.Fatal("重复调用应删除 name（幂等）")
+	}
+	stripToolCallNames(frame, seen) // 第三次：不 panic
+}
+
+// 验证流式链路上 name 只出现一次（端到端）。
+func TestStreamChatResponseStripsRepeatedToolNames(t *testing.T) {
+	chdirTemp(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// 上游在每一帧都重复下发 name（真实形态）
+		for i, args := range []string{`{"cmd":`, `"ls"}`} {
+			_ = i
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":"+strconv.Quote(args)+"}}]}}]}\n\n")
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	acc := &Account{Path: "st.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}}}
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 统计下游收到的帧里 function.name 出现次数：应恰好 1 次
+	nameCount := strings.Count(rec.Body.String(), `"name":"Bash"`)
+	if nameCount != 1 {
+		t.Fatalf("name 应只出现 1 次（实际 %d）——累加型客户端会拼成 BashBash:\n%s", nameCount, rec.Body.String())
+	}
+}
+
+// -----------------------------------------------------------------------------
+// max_completion_tokens 翻译测试
+// -----------------------------------------------------------------------------
+
+// 验证别名翻译规则：显式 max_tokens 优先、非正值不译、畸形不译、别名一律删除。
+func TestTranslateMaxCompletionTokens(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         map[string]any
+		wantMax    any
+		wantHasMax bool
+	}{
+		{"别名翻译为 max_tokens", map[string]any{"max_completion_tokens": float64(128)}, int64(128), true},
+		{"显式 max_tokens 优先（别名只删）", map[string]any{"max_completion_tokens": float64(128), "max_tokens": 64}, 64, true},
+		{"零值不翻译", map[string]any{"max_completion_tokens": float64(0)}, nil, false},
+		{"负数不翻译", map[string]any{"max_completion_tokens": float64(-5)}, nil, false},
+		{"非整数不翻译", map[string]any{"max_completion_tokens": float64(1.5)}, nil, false},
+		{"字符串畸形不翻译", map[string]any{"max_completion_tokens": "128"}, nil, false},
+		{"null 不翻译", map[string]any{"max_completion_tokens": nil}, nil, false},
+		{"无别名字段", map[string]any{"model": "m"}, nil, false},
+	}
+	for _, c := range cases {
+		translateMaxCompletionTokens(c.in)
+		if _, ok := c.in["max_completion_tokens"]; ok {
+			t.Errorf("%s: 别名应一律删除", c.name)
+		}
+		got, has := c.in["max_tokens"]
+		if has != c.wantHasMax {
+			t.Errorf("%s: max_tokens 存在性 = %v, want %v", c.name, has, c.wantHasMax)
+			continue
+		}
+		if c.wantHasMax && got != c.wantMax {
+			t.Errorf("%s: max_tokens = %#v, want %#v", c.name, got, c.wantMax)
+		}
+	}
+}
+
+// 验证端到端：客户端传 max_completion_tokens 时上游收到 max_tokens（不再 400）。
+func TestChatHandlerTranslatesMaxCompletionTokens(t *testing.T) {
+	chdirTemp(t)
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":500}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	acc := &Account{Path: "mt.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}}}
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"max_completion_tokens":256,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(got), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["max_tokens"] != float64(256) {
+		t.Fatalf("上游应收到 max_tokens=256，实际 %#v", sent["max_tokens"])
+	}
+	if _, ok := sent["max_completion_tokens"]; ok {
+		t.Fatal("别名不应透传到上游")
 	}
 }
 
