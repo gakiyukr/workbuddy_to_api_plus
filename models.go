@@ -189,10 +189,13 @@ func fetchLiveCatalog(edition string) ([]catalogModel, int, error) {
 	accountMu.Lock()
 	auth := *acc.Auth
 	accountMu.Unlock()
-	return fetchLiveCatalogByAuth(&auth)
+	return fetchLiveCatalogByAuth(&auth, clientForAccount(acc))
 }
 
-func fetchLiveCatalogByAuth(auth *StoredAuth) ([]catalogModel, int, error) {
+func fetchLiveCatalogByAuth(auth *StoredAuth, client *http.Client) ([]catalogModel, int, error) {
+	if client == nil {
+		client = cfg.HttpClient
+	}
 	prof := profileForEdition(auth.Edition)
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
@@ -210,7 +213,7 @@ func fetchLiveCatalogByAuth(auth *StoredAuth) ([]catalogModel, int, error) {
 			r.Header.Set("X-Domain", auth.Auth.Domain)
 		}
 	}
-	data, status, err := doJSON(cfg.HttpClient, http.MethodGet, prof.Base+modelsPath, headers, nil)
+	data, status, err := doJSON(client, http.MethodGet, prof.Base+modelsPath, headers, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("HTTP %d: %w", status, err)
 	}
@@ -652,12 +655,13 @@ func siteKnownFree(site, modelID string) bool {
 		return true
 	}
 	accountMu.Lock()
+	now := time.Now()
 	for _, acc := range accounts {
 		if profileForEdition(acc.Auth.Edition).Key != site && acc.Edition != site {
 			continue
 		}
 		if acc.ModelStates != nil {
-			if st := acc.ModelStates[normalizeModelName(modelID)]; st != nil && st.CostClass == modelCostFree {
+			if st := acc.ModelStates[normalizeModelName(modelID)]; st != nil && modelCostTier(st, now) == 0 {
 				accountMu.Unlock()
 				return true
 			}
@@ -1005,7 +1009,7 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 		return "", 0, 0, err.Error()
 	}
 	backendHeaders(req, &auth, prof, "", newMessageID())
-	resp, err := cfg.HttpClient.Do(req)
+	resp, err := clientForAccount(acc).Do(req)
 	if err != nil {
 		return "", 0, 0, "请求失败: " + err.Error()
 	}

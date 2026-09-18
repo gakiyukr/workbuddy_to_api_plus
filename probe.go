@@ -202,7 +202,7 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 	}
 	backendHeaders(req, &auth, prof, "", newMessageID())
 
-	resp, err := cfg.HttpClient.Do(req)
+	resp, err := clientForAccount(acc).Do(req)
 	if err != nil {
 		result.Status = "error"
 		result.Detail = "上游请求失败: " + err.Error()

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -185,26 +186,28 @@ type quotaSummaryData struct {
 // -----------------------------------------------------------------------------
 
 type Config struct {
-	Addr            string
-	Port            int
-	AuthFile        string
-	AuthDir         string
-	AuthExplicit    bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
-	LoginIntl       bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
-	APIKey          string
-	ProxyURL        string
-	Verbose         bool
-	ReloadInterval  int    // 账号池热加载扫描间隔（秒），0 关闭
-	MonitorInterval int    // monitor 状态刷新间隔（秒）
-	LogFile         string // monitor 附加展示的日志文件路径
-	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
-	LogLines        int    // monitor 展示的最近日志行数
-	PromptMode      string // 系统提示词模式：passthrough（透传）/ custom（替换）/ append（插入）
-	PromptText      string // custom/append 模式使用的网关提示词文本，空 = 内置中性提示词
-	ModelsRefresh   int    // 官方模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）
-	ProbeModels     string // probe 专用：逗号分隔的模型列表
-	ProbeLimit      int    // probe 专用：未显式指定模型时的取用数量
-	HttpClient      *http.Client
+	Addr                string
+	Port                int
+	AuthFile            string
+	AuthDir             string
+	AuthExplicit        bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
+	LoginIntl           bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
+	APIKey              string
+	ProxyURL            string
+	Verbose             bool
+	ReloadInterval      int           // 账号池热加载扫描间隔（秒），0 关闭
+	MonitorInterval     int           // monitor 状态刷新间隔（秒）
+	LogFile             string        // monitor 附加展示的日志文件路径
+	JournalService      string        // monitor 附加展示的 systemd 服务名（journalctl -u）
+	LogLines            int           // monitor 展示的最近日志行数
+	PromptMode          string        // 系统提示词模式：passthrough（透传）/ custom（替换）/ append（插入）
+	PromptText          string        // custom/append 模式使用的网关提示词文本，空 = 内置中性提示词
+	ModelsRefresh       int           // 官方模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）
+	ProbeModels         string        // probe 专用：逗号分隔的模型列表
+	ProbeLimit          int           // probe 专用：未显式指定模型时的取用数量
+	CostExploreInterval time.Duration // costTier 条件探索窗口（默认 30m，0 关停）：免费层垄断 + 存在未知层账号时，按窗口把一次选号改道给未知号搭车学习
+	ProxyURLs           []string      // 多代理池（-proxies，逗号分隔）：账号按凭据文件名稳定绑定到其中一个出口 IP
+	HttpClient          *http.Client
 }
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
@@ -239,6 +242,19 @@ const (
 	// credit=0（例如探针请求），那不是真正的免费，不能据此让零余额账号请求收费模型。
 	modelFreeMinTokens = 100
 
+	// modelCostTTL 成本观测有效期：超过该时长的免费/收费观测视为未知（重新学习）。
+	// 限免/夜间免费是时段性的，陈旧观测复活会把流量错误地导向收费账号（wb2api 同款口径）。
+	modelCostTTL = 6 * time.Hour
+
+	// modelCostEMAAlpha 每千 token 单价的 EMA 平滑系数（约 5 次观测收敛，
+	// wb2api 同口径）：单次异常值不主导账本。
+	modelCostEMAAlpha = 0.3
+
+	// modelCostExploreDefault costTier 条件探索的默认窗口（wb2api issue #136 方案 a′）：
+	// 免费层垄断且存在未知层账号时，按窗口把一次选号改道给未知层搭车学习。
+	// 30m ≈ 每模型 ≤48 次/天；0 = 关停。
+	modelCostExploreDefault = 30 * time.Minute
+
 	// wafCooldownBase WAF 403 拦截的账号软冷却时长。
 	//
 	// 与 429 频率限制的冷却语义区分：WAF 拦的是出口 IP 而非账号（多账号在同一
@@ -266,6 +282,12 @@ type modelRuntimeState struct {
 	NextProbeAt   time.Time
 	LastReason    string
 	ObservedAt    time.Time
+	// CostPer1k 实测每千 token 单价（EMA 平滑值，<=0 = 实测免费）。
+	// 与 CostClass 互补：CostClass 是二值结论，CostPer1k 保留「收费多少」的
+	// 量级信息，用于同档内择优与 monitor 展示。
+	CostPer1k float64
+	// CostSamples 累计观测次数（EMA 收敛度参考）。
+	CostSamples int
 }
 
 type accountSelectionKind string
@@ -274,6 +296,9 @@ const (
 	selectionNormal         accountSelectionKind = "normal"
 	selectionFreeExhausted  accountSelectionKind = "free_exhausted"
 	selectionProbeExhausted accountSelectionKind = "probe_exhausted"
+	// selectionExploreProbe 搭车学习改道到受控探测路径的独立类型：
+	// 失败按常规轮转回退继续本次请求，不触发纯探测的 503 短路。
+	selectionExploreProbe accountSelectionKind = "explore_probe"
 )
 
 // Profile 返回该账号对应的上游站点参数（国内站/国际站）。
@@ -309,6 +334,14 @@ var (
 	accounts  []*Account // 多账号池（单账号时长度为 1，行为与旧版完全一致）
 	rrIndex   int        // 轮询游标
 
+	// costExploreLast 各模型的上次条件探索时刻（accountMu 保护；运行态不持久化，
+	// 重启归零 → 每个仍冻结的模型至多一次即时重探，已学到的账本经快照恢复）。
+	costExploreLast   = map[string]time.Time{}
+	costExploreEvents int64 // 累计条件探索次数（accountMu 保护，monitor/调试可读）
+
+	// proxyClients 多代理池的 HTTP 客户端表（代理 URL → 客户端，initHTTPClient 构建）。
+	proxyClients = map[string]*http.Client{}
+
 	quotaScanTrigger = make(chan struct{}, 1)
 	checkinTrigger   = make(chan struct{}, 1)
 	dailyCheckinMu   sync.Mutex
@@ -334,6 +367,7 @@ func main() {
 		args = os.Args[2:]
 	}
 
+	proxyList := ""
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
 	fs.StringVar(&cfg.Addr, "addr", "127.0.0.1", "网关监听地址")
 	fs.IntVar(&cfg.Port, "port", 8317, "网关监听端口")
@@ -353,7 +387,16 @@ func main() {
 	fs.StringVar(&cfg.PromptText, "prompt-text", "", "custom/append 模式的网关系统提示词文本，空 = 内置中性提示词")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未显式指定模型时探测的模型数量上限")
+	fs.DurationVar(&cfg.CostExploreInterval, "cost-explore-interval", modelCostExploreDefault, "costTier 条件探索窗口：免费层垄断时按窗口改道一次给未知账号搭车学习（0 关停）")
+	fs.StringVar(&proxyList, "proxies", "", "多代理池（逗号分隔）：账号按凭据文件名稳定绑定到其中一个出口 IP")
 	_ = fs.Parse(args)
+
+	// -proxies 逗号分隔解析：去空白、忽略空项。
+	for _, p := range strings.Split(proxyList, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			cfg.ProxyURLs = append(cfg.ProxyURLs, p)
+		}
+	}
 
 	// 若未指定 -auth 且未指定 -auth-dir，则自动扫描当前目录下所有 workbuddy*.json 组成账号池，
 	// 这样把多个凭据文件放进工作目录即可自动多账号，无需手写参数。
@@ -442,6 +485,12 @@ func printHelp() {
   -models-refresh <min>
                     模型目录刷新间隔（默认 60 分钟，0 关闭）
                     （目录来源：实时接口 + npm 静态包，合并去重）
+  -cost-explore-interval <dur>
+                    costTier 条件探索窗口（默认 30m，0 关停）：免费层垄断时
+                    按窗口把一次选号改道给未知账号搭车学习（零新增上游请求）
+  -proxies <url1,url2,...>
+                    多代理池（逗号分隔）：账号按凭据文件名稳定绑定到其中一个
+                    出口 IP；与 -proxy 可并用（-proxies 优先用于账号维度调用）
 
 probe 选项:
   -auth <path>      只探测指定凭据文件（文件名或路径均可）；默认探测全部账号
@@ -487,29 +536,78 @@ monitor 选项:
   workbuddy-gateway serve
 
   # 启动网关并指定端口和代理
-  workbuddy-gateway serve -port 9000 -proxy http://127.0.0.1:7890`)
+  workbuddy-gateway serve -port 9000 -proxy http://127.0.0.1:7890
+
+  # 多代理池：账号按文件名稳定散列到多个出口 IP（规避单 IP 风控）
+  workbuddy-gateway serve -proxies http://127.0.0.1:7890,socks5://127.0.0.1:1080`)
 }
 
 func initHTTPClient() {
 	jar, _ := cookiejar.New(nil)
-	transport := &http.Transport{
-		MaxIdleConns:        50,
-		IdleConnTimeout:     90 * time.Second,
-		MaxIdleConnsPerHost: 10,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
-	}
-	if cfg.ProxyURL != "" {
-		pURL, err := url.Parse(cfg.ProxyURL)
-		if err != nil {
-			log.Fatalf("错误: 无效的代理地址 %s: %v", cfg.ProxyURL, err)
+	newTransport := func(proxyURL string) (*http.Transport, error) {
+		transport := &http.Transport{
+			MaxIdleConns:        50,
+			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConnsPerHost: 10,
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
 		}
-		transport.Proxy = http.ProxyURL(pURL)
+		if proxyURL != "" {
+			pURL, err := url.Parse(proxyURL)
+			if err != nil {
+				return nil, fmt.Errorf("无效的代理地址 %s: %w", proxyURL, err)
+			}
+			transport.Proxy = http.ProxyURL(pURL)
+		}
+		return transport, nil
+	}
+	transport, err := newTransport(cfg.ProxyURL)
+	if err != nil {
+		log.Fatalf("错误: %v", err)
 	}
 	cfg.HttpClient = &http.Client{
 		Timeout:   180 * time.Second,
 		Transport: transport,
 		Jar:       jar,
 	}
+	// 多代理池（-proxies）：每个出口代理一个独立客户端（共享 cookie jar），
+	// 账号按凭据文件名稳定绑定到其中一个（见 clientForAccount）。绑定只作用于
+	// 账号维度的上游调用；未绑定的调用（npm 目录等）仍走全局客户端。
+	proxyClients = make(map[string]*http.Client, len(cfg.ProxyURLs))
+	for _, proxyURL := range cfg.ProxyURLs {
+		poolTransport, err := newTransport(proxyURL)
+		if err != nil {
+			log.Fatalf("错误: %v", err)
+		}
+		proxyClients[proxyURL] = &http.Client{
+			Timeout:   180 * time.Second,
+			Transport: poolTransport,
+			Jar:       jar,
+		}
+	}
+}
+
+// boundProxyURL 返回账号稳定绑定的出口代理 URL；未配置代理池时返回空串。
+// 绑定键用凭据文件名（而非完整路径）：部署目录变化不影响绑定稳定性，
+// 同一账号永远走同一出口 IP（上游风控按 IP 记账，绑定漂移会放大风险）。
+func boundProxyURL(acc *Account) string {
+	if acc == nil || len(cfg.ProxyURLs) == 0 {
+		return ""
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(filepath.Base(acc.Path)))
+	return cfg.ProxyURLs[int(h.Sum32())%len(cfg.ProxyURLs)]
+}
+
+// clientForAccount 返回账号绑定的 HTTP 客户端：配置多代理池时按文件名散列到
+// 池内一个出口；未配置（或客户端缺失）时回退全局客户端。
+func clientForAccount(acc *Account) *http.Client {
+	if acc == nil || len(cfg.ProxyURLs) == 0 {
+		return cfg.HttpClient
+	}
+	if client := proxyClients[boundProxyURL(acc)]; client != nil {
+		return client
+	}
+	return cfg.HttpClient
 }
 
 // -----------------------------------------------------------------------------
@@ -722,6 +820,7 @@ func restoreAccountRuntimeStateLocked() {
 				CostClass: saved.CostClass, CooldownUntil: timeFromUnix(saved.CooldownUntil),
 				QuotaBlocked: saved.QuotaBlocked, NextProbeAt: timeFromUnix(saved.NextProbeAt),
 				LastReason: saved.LastReason, ObservedAt: timeFromUnix(saved.ObservedAt),
+				CostPer1k: saved.CostPer1k, CostSamples: saved.CostSamples,
 			}
 		}
 	}
@@ -885,6 +984,45 @@ func modelStateLocked(acc *Account, model string) *modelRuntimeState {
 	return state
 }
 
+// modelCostTier 成本分层（wb2api costTier 口径，移植裁剪版）：
+//
+//	0 = 已实测免费（限免期/夜间免费，最强偏好）
+//	1 = 无观测或观测过期（学习期账号不饿死）
+//	2 = 已实测收费（兜底层）
+//
+// 观测超过 modelCostTTL 即视为过期（时段性优惠不复活）。
+func modelCostTier(state *modelRuntimeState, now time.Time) int {
+	if state == nil {
+		return 1
+	}
+	if !state.ObservedAt.IsZero() && now.Sub(state.ObservedAt) > modelCostTTL {
+		return 1
+	}
+	switch state.CostClass {
+	case modelCostFree:
+		return 0
+	case modelCostPaid:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// modelCostPer1kOf 读取账号某模型的实测单价（EMA）；无有效观测（含观测过期）返回 false。
+func modelCostPer1kOf(acc *Account, model string, now time.Time) (float64, bool) {
+	if acc == nil {
+		return 0, false
+	}
+	state := acc.ModelStates[normalizeModelName(model)]
+	if state == nil || state.CostSamples == 0 {
+		return 0, false
+	}
+	if !state.ObservedAt.IsZero() && now.Sub(state.ObservedAt) > modelCostTTL {
+		return 0, false
+	}
+	return state.CostPer1k, true
+}
+
 func usableForModelLocked(acc *Account, model string, now time.Time) (accountSelectionKind, bool) {
 	if acc.Disabled || acc.CooldownUntil.After(now) {
 		return "", false
@@ -906,10 +1044,15 @@ func usableForModelLocked(acc *Account, model string, now time.Time) (accountSel
 	if !acc.QuotaExhausted {
 		return selectionNormal, true
 	}
-	if state.CostClass == modelCostFree && !state.QuotaBlocked {
+	// 成本分层（TTL 感知，见 modelCostTier）：实测免费 → 免费耗尽路径；
+	// 实测收费 → 本轮不可用（由有余额账号兜底）；未知/观测过期 → 受控探测路径。
+	switch modelCostTier(state, now) {
+	case 0:
 		return selectionFreeExhausted, true
+	case 2:
+		return "", false
 	}
-	if state.CostClass == modelCostPaid || now.Before(state.NextProbeAt) {
+	if now.Before(state.NextProbeAt) {
 		return "", false
 	}
 	return selectionProbeExhausted, true
@@ -930,29 +1073,103 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 	}
 	now := time.Now()
 
+	type pickCandidate struct {
+		idx  int
+		acc  *Account
+		kind accountSelectionKind
+		tier int
+	}
+	// 选择优先级：免费耗尽 > 有余额 > 受控探测（原语义不变）；同优先级内叠加
+	// 成本分层：已实测免费(0) > 未知/过期(1) > 已实测收费(2)，收费层内单价低者优先。
+	kindRank := func(k accountSelectionKind) int {
+		switch k {
+		case selectionFreeExhausted:
+			return 0
+		case selectionNormal:
+			return 1
+		default:
+			return 2
+		}
+	}
 	pick := func(siteFilter func(string) bool) (*Account, accountSelectionKind, bool) {
-		for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
-			for i := 0; i < len(accounts); i++ {
-				idx := (rrIndex + i) % len(accounts)
-				acc := accounts[idx]
-				if attempted != nil && attempted[acc] {
-					continue
-				}
-				if siteFilter != nil && !siteFilter(accSiteLocked(acc)) {
-					continue
-				}
-				kind, ok := usableForModelLocked(acc, model, now)
-				if !ok || kind != wanted {
-					continue
-				}
-				if kind == selectionProbeExhausted {
-					modelStateLocked(acc, model).NextProbeAt = now.Add(modelProbeDelay)
-				}
-				rrIndex = (idx + 1) % len(accounts)
-				return acc, kind, true
+		var cands []pickCandidate
+		for i := range len(accounts) {
+			idx := (rrIndex + i) % len(accounts)
+			acc := accounts[idx]
+			if attempted != nil && attempted[acc] {
+				continue
+			}
+			if siteFilter != nil && !siteFilter(accSiteLocked(acc)) {
+				continue
+			}
+			kind, ok := usableForModelLocked(acc, model, now)
+			if !ok {
+				continue
+			}
+			cands = append(cands, pickCandidate{
+				idx: idx, acc: acc, kind: kind,
+				tier: modelCostTier(acc.ModelStates[normalizeModelName(model)], now),
+			})
+		}
+		if len(cands) == 0 {
+			return nil, "", false
+		}
+		best := cands[0]
+		for _, c := range cands[1:] {
+			if kindRank(c.kind) < kindRank(best.kind) ||
+				(kindRank(c.kind) == kindRank(best.kind) && c.tier < best.tier) {
+				best = c
 			}
 		}
-		return nil, "", false
+		// 收费层内择优：单价低者优先（无有效单价的候选保持轮询序）。
+		if best.kind == selectionNormal && best.tier == 2 {
+			bestCost, hasBest := modelCostPer1kOf(best.acc, model, now)
+			for _, c := range cands {
+				if c.kind != selectionNormal || c.tier != 2 {
+					continue
+				}
+				cost, ok := modelCostPer1kOf(c.acc, model, now)
+				if !ok {
+					continue
+				}
+				if !hasBest || cost < bestCost {
+					best, bestCost, hasBest = c, cost, true
+				}
+			}
+		}
+		// costTier 条件探索（移植自 wb2api issue #136 方案 a′）：最优候选全在免费层
+		// （tier 0 垄断）且存在未知层（tier 1）候选时，按探索窗口把一次选号改道给
+		// 未知账号搭车学习——承接真实用户请求，零新增上游调用；学成即毕业。
+		if model != "" && best.tier == 0 && cfg.CostExploreInterval > 0 {
+			var explore *pickCandidate
+			for i := range cands {
+				c := &cands[i]
+				if c.tier != 1 {
+					continue
+				}
+				// 优先有余额账号（普通路径），其次受控探测路径。
+				if explore == nil || (explore.kind != selectionNormal && c.kind == selectionNormal) {
+					explore = c
+				}
+			}
+			if explore != nil && now.Sub(costExploreLast[model]) >= cfg.CostExploreInterval {
+				costExploreLast[model] = now
+				costExploreEvents++
+				log.Printf("[CostExplore] 模型 %s 免费层垄断，按窗口（%v）改道一次给未知账号 %s 搭车学习",
+					model, cfg.CostExploreInterval, explore.acc.Path)
+				best = *explore
+				if best.kind == selectionProbeExhausted {
+					// 改道到受控探测路径时换独立类型：失败按常规轮转回退继续本次
+					// 请求，而不是按纯探测语义短路 503（免费层账号本可服务）。
+					best.kind = selectionExploreProbe
+				}
+			}
+		}
+		if best.kind == selectionProbeExhausted || best.kind == selectionExploreProbe {
+			modelStateLocked(best.acc, model).NextProbeAt = now.Add(modelProbeDelay)
+		}
+		rrIndex = (best.idx + 1) % len(accounts)
+		return best.acc, best.kind, true
 	}
 
 	if len(preferred) > 0 {
@@ -989,7 +1206,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 				if earliest.IsZero() || state.CooldownUntil.Before(earliest) {
 					earliest = state.CooldownUntil
 				}
-			} else if state.QuotaBlocked || acc.QuotaExhausted && state.CostClass == modelCostPaid {
+			} else if state.QuotaBlocked || acc.QuotaExhausted && modelCostTier(state, now) == 2 {
 				quotaBlocked++
 			} else if acc.QuotaExhausted && now.Before(state.NextProbeAt) {
 				probeWaiting++
@@ -1550,7 +1767,7 @@ func doRefreshToken(sa *StoredAuth) error {
 	if sa == nil || sa.Auth.RefreshToken == "" {
 		return fmt.Errorf("无法刷新：缺少 RefreshToken")
 	}
-	if _, err := refreshTokenPayload(sa); err != nil {
+	if _, err := refreshTokenPayload(sa, nil); err != nil {
 		return err
 	}
 	if err := saveAuth(sa); err != nil {
@@ -1582,7 +1799,7 @@ func doRefreshTokenFor(acc *Account) error {
 	accountMu.Unlock()
 
 	log.Printf("[Auth] 账号 %s 开始刷新 Token，站点=%s，刷新前过期时间=%s", path, profileForEdition(refreshed.Edition).Label, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"))
-	status, err := refreshTokenPayload(&refreshed)
+	status, err := refreshTokenPayload(&refreshed, clientForAccount(acc))
 	if err != nil {
 		log.Printf("[Auth] 账号 %s Token 刷新失败，HTTP=%d，原因=%v，旧凭据未覆盖", path, status, err)
 		if isAuthFailure(status, err.Error()) {
@@ -1619,7 +1836,10 @@ func doRefreshTokenFor(acc *Account) error {
 // refreshTokenPayload 调用上游刷新接口并更新内存中的令牌字段（不落盘）。
 // 按凭据文件中的 edition 路由到对应站点（国内站/国际站）的刷新接口。
 // 返回上游 HTTP 状态码（成功或失败时均为实际状态；网络错误为 0）。
-func refreshTokenPayload(sa *StoredAuth) (int, error) {
+func refreshTokenPayload(sa *StoredAuth, client *http.Client) (int, error) {
+	if client == nil {
+		client = cfg.HttpClient
+	}
 	prof := profileForEdition(sa.Edition)
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
@@ -1630,7 +1850,7 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 		r.Header.Set("X-Auth-Refresh-Source", "workbuddy")
 	}
 
-	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, prof.tokenRefreshURL(), headers, nil)
+	data, status, err := doJSON(client, http.MethodPost, prof.tokenRefreshURL(), headers, nil)
 	if err != nil {
 		return status, fmt.Errorf("上游刷新拒绝 (HTTP %d): %w", status, err)
 	}
@@ -1766,6 +1986,15 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 			return
 		}
 	}
+	// 每千 token 单价（EMA 平滑，wb2api 同口径）：tokens 无效时不动单价账本。
+	per1k, hasPer1k := 0.0, false
+	if tokens, ok := usageTotalTokens(usage); ok && tokens > 0 {
+		per1k = credit / float64(tokens) * 1000
+		if per1k < 0 {
+			per1k = 0
+		}
+		hasPer1k = true
+	}
 	accountMu.Lock()
 	state := modelStateLocked(acc, model)
 	oldClass := state.CostClass
@@ -1774,6 +2003,14 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 		state.QuotaBlocked = false
 	} else {
 		state.CostClass = modelCostPaid
+	}
+	if hasPer1k {
+		if state.CostSamples == 0 {
+			state.CostPer1k = per1k
+		} else {
+			state.CostPer1k = state.CostPer1k*(1-modelCostEMAAlpha) + per1k*modelCostEMAAlpha
+		}
+		state.CostSamples++
 	}
 	state.ObservedAt = time.Now()
 	quotaExhausted := acc.QuotaExhausted
@@ -1823,7 +2060,7 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
 		}
 	}
-	data, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
+	data, status, err := doJSONContext(ctx, clientForAccount(acc), http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
 	if err != nil {
 		log.Printf("[Quota] 账号 %s 查询额度失败，HTTP=%d，原因=%v，保留上一次额度数据", path, status, err)
 		return err
@@ -1984,7 +2221,7 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 			r.Header.Set("X-Domain", auth.Auth.Domain)
 		}
 	}
-	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
+	_, status, err := doJSONContext(ctx, clientForAccount(acc), http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
 	if err == nil {
 		log.Printf("[Checkin] 账号 %s 每日签到成功", path)
 		return "ok", nil
@@ -2124,6 +2361,62 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	}
 	sb.WriteString(fmt.Sprintf("Token 状态:   %s\n", statusStr))
 	sb.WriteString(fmt.Sprintf("过期时间:     %s (剩余 %v)\n", expTime.Format("2006-01-02 15:04:05"), remaining.Round(time.Minute)))
+	if ledger := formatModelCostLedger(acc, now); ledger != "" {
+		sb.WriteString(ledger)
+	}
+	return sb.String()
+}
+
+// formatModelCostLedger 生成账号的模型成本账本摘要（status/启动横幅用）。
+// 只展示有有效观测的模型：免费（tier 0）在前，收费按单价升序；最多 8 行。
+func formatModelCostLedger(acc *Account, now time.Time) string {
+	type row struct {
+		model   string
+		free    bool
+		per1k   float64
+		samples int
+	}
+	var rows []row
+	for model, state := range acc.ModelStates {
+		if state.CostSamples == 0 {
+			continue
+		}
+		if !state.ObservedAt.IsZero() && now.Sub(state.ObservedAt) > modelCostTTL {
+			continue // 观测过期：不再展示（重新学习后恢复）
+		}
+		rows = append(rows, row{model: model, free: state.CostClass == modelCostFree, per1k: state.CostPer1k, samples: state.CostSamples})
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].free != rows[j].free {
+			return rows[i].free
+		}
+		if rows[i].per1k != rows[j].per1k {
+			return rows[i].per1k < rows[j].per1k
+		}
+		return rows[i].model < rows[j].model
+	})
+	freeCount := 0
+	for _, r := range rows {
+		if r.free {
+			freeCount++
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("模型账本:     %d 个模型（免费 %d / 收费 %d）\n", len(rows), freeCount, len(rows)-freeCount))
+	limit := min(len(rows), 8)
+	for _, r := range rows[:limit] {
+		if r.free {
+			sb.WriteString(fmt.Sprintf("  - %-28s 免费 (样本 %d)\n", r.model, r.samples))
+		} else {
+			sb.WriteString(fmt.Sprintf("  - %-28s %.4f/1k (样本 %d)\n", r.model, r.per1k, r.samples))
+		}
+	}
+	if len(rows) > limit {
+		sb.WriteString(fmt.Sprintf("  ... 其余 %d 个见 workbuddy-status.json\n", len(rows)-limit))
+	}
 	return sb.String()
 }
 
@@ -2208,19 +2501,22 @@ type accountSnapshot struct {
 }
 
 type modelStateSnapshot struct {
-	CostClass     string `json:"costClass,omitempty"`
-	CooldownUntil int64  `json:"cooldownUntil,omitempty"`
-	QuotaBlocked  bool   `json:"quotaBlocked,omitempty"`
-	NextProbeAt   int64  `json:"nextProbeAt,omitempty"`
-	LastReason    string `json:"lastReason,omitempty"`
-	ObservedAt    int64  `json:"observedAt,omitempty"`
+	CostClass     string  `json:"costClass,omitempty"`
+	CooldownUntil int64   `json:"cooldownUntil,omitempty"`
+	QuotaBlocked  bool    `json:"quotaBlocked,omitempty"`
+	NextProbeAt   int64   `json:"nextProbeAt,omitempty"`
+	LastReason    string  `json:"lastReason,omitempty"`
+	ObservedAt    int64   `json:"observedAt,omitempty"`
+	CostPer1k     float64 `json:"costPer1k,omitempty"`
+	CostSamples   int     `json:"costSamples,omitempty"`
 }
 
 // statusSnapshot 是写入 workbuddy-status.json 的完整快照。
 type statusSnapshot struct {
-	UpdatedAt int64               `json:"updatedAt"`
-	Accounts  []accountSnapshot   `json:"accounts"`
-	Models    []modelStatSnapshot `json:"models,omitempty"`
+	UpdatedAt         int64               `json:"updatedAt"`
+	Accounts          []accountSnapshot   `json:"accounts"`
+	Models            []modelStatSnapshot `json:"models,omitempty"`
+	CostExploreEvents int64               `json:"costExploreEvents,omitempty"` // 累计 costTier 条件探索次数
 }
 
 // writeStatusSnapshot 将账号池实时状态（含冷却/失效）原子写入状态快照文件。
@@ -2250,6 +2546,7 @@ func writeStatusSnapshot() {
 					CostClass: state.CostClass, CooldownUntil: unixOrZero(state.CooldownUntil),
 					QuotaBlocked: state.QuotaBlocked, NextProbeAt: unixOrZero(state.NextProbeAt),
 					LastReason: state.LastReason, ObservedAt: unixOrZero(state.ObservedAt),
+					CostPer1k: state.CostPer1k, CostSamples: state.CostSamples,
 				}
 			}
 		}
@@ -2296,6 +2593,7 @@ func writeStatusSnapshot() {
 		snap.Accounts = append(snap.Accounts, as)
 	}
 	snap.Models = buildModelStatSnapshots(now, accounts)
+	snap.CostExploreEvents = costExploreEvents
 	accountMu.Unlock()
 
 	data, err := json.MarshalIndent(snap, "", "  ")
@@ -2772,6 +3070,12 @@ func runServe() {
 	if cfg.ProxyURL != "" {
 		fmt.Printf("   上游出口代理:  %s\n", cfg.ProxyURL)
 	}
+	if len(cfg.ProxyURLs) > 0 {
+		fmt.Printf("   多代理池:      %d 个出口（账号按凭据文件名稳定绑定）\n", len(cfg.ProxyURLs))
+		for i, p := range cfg.ProxyURLs {
+			fmt.Printf("     [%d] %s\n", i+1, p)
+		}
+	}
 
 	// 启动时展示所有账号状态（与 status 命令一致）
 	accountMu.Lock()
@@ -3011,7 +3315,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			upstreamReq.Header.Set("X-Conversation-ID", conversationID)
 		}
 		backendHeaders(upstreamReq, acc.Auth, prof, convReqID, newMessageID())
-		resp, err := cfg.HttpClient.Do(upstreamReq)
+		resp, err := clientForAccount(acc).Do(upstreamReq)
 		acc.lock.Unlock()
 		if err != nil {
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
@@ -3050,6 +3354,9 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 					writeOpenAIError(w, http.StatusServiceUnavailable, "model_requires_quota", msg)
 					return nil, nil, nil, false
 				}
+				if selection == selectionExploreProbe {
+					log.Printf("[CostExplore] 账号 %s 搭车学习失败（模型 %s 需付费额度），回退常规选号继续本次请求", acc.Path, modelName)
+				}
 				lastRateErr = errStr
 				continue
 
@@ -3064,6 +3371,9 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
 					writeOpenAIError(w, http.StatusServiceUnavailable, "model_rate_limited", msg)
 					return nil, nil, nil, false
+				}
+				if selection == selectionExploreProbe {
+					log.Printf("[CostExplore] 账号 %s 搭车学习失败（模型 %s 触发模型级限流），回退常规选号继续本次请求", acc.Path, modelName)
 				}
 				lastRateErr = errStr
 				continue

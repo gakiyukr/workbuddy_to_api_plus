@@ -1888,9 +1888,9 @@ func TestValidB3TraceID(t *testing.T) {
 		in   string
 		want bool
 	}{
-		{"0123456789abcdef0123456789abcdef", true}, // 32 hex
-		{"0123456789abcdef", true},                 // 16 hex
-		{"0123456789ABCDEF0123456789ABCDEF", true}, // 大写
+		{"0123456789abcdef0123456789abcdef", true},      // 32 hex
+		{"0123456789abcdef", true},                      // 16 hex
+		{"0123456789ABCDEF0123456789ABCDEF", true},      // 大写
 		{"550e8400-e29b-41d4-a716-446655440000", false}, // 带横线 UUID
 		{"", false},
 		{"short", false},
@@ -1965,9 +1965,9 @@ func TestNextMidnightCST(t *testing.T) {
 		now  time.Time
 	}{
 		{"白天", time.Date(2026, 9, 17, 14, 0, 0, 0, time.UTC)},
-		{"23:59 CST", time.Date(2026, 9, 17, 15, 59, 0, 0, time.UTC)},  // CST 23:59
-		{"00:00 CST", time.Date(2026, 9, 17, 16, 0, 0, 0, time.UTC)},   // CST 00:00
-		{"00:01 CST", time.Date(2026, 9, 17, 16, 1, 0, 0, time.UTC)},   // CST 00:01
+		{"23:59 CST", time.Date(2026, 9, 17, 15, 59, 0, 0, time.UTC)}, // CST 23:59
+		{"00:00 CST", time.Date(2026, 9, 17, 16, 0, 0, 0, time.UTC)},  // CST 00:00
+		{"00:01 CST", time.Date(2026, 9, 17, 16, 1, 0, 0, time.UTC)},  // CST 00:01
 	}
 	cst := time.FixedZone("CST", 8*60*60)
 	for _, c := range cases {
@@ -2103,5 +2103,394 @@ func TestRewriteSystemTo(t *testing.T) {
 	bad := []byte("{broken")
 	if got := rewriteSystemTo(bad, "x"); string(got) != string(bad) {
 		t.Errorf("坏 JSON 应原样返回, got %q", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Phase 4：成本账本（EMA 单价 / TTL / 分层选号 / 条件探索 / 持久化 / 展示）
+// -----------------------------------------------------------------------------
+
+// 验证成本账本的 EMA 单价学习：首次观测直接落账，后续观测按 α=0.3 平滑。
+func TestModelCostEMA(t *testing.T) {
+	acc := &Account{Path: "ema.json", Auth: &StoredAuth{}}
+	observeModelCredit(acc, "ema-model", map[string]any{"credit": 1.0, "total_tokens": 1000}, 1)
+	accountMu.Lock()
+	state := acc.ModelStates["ema-model"]
+	first, samples := state.CostPer1k, state.CostSamples
+	accountMu.Unlock()
+	if samples != 1 || first <= 0 || first > 2 {
+		t.Fatalf("首次观测 per1k=%v samples=%d，期望 ≈1.0/1", first, samples)
+	}
+	observeModelCredit(acc, "ema-model", map[string]any{"credit": 3.0, "total_tokens": 1000}, 2)
+	accountMu.Lock()
+	state = acc.ModelStates["ema-model"]
+	second, samples := state.CostPer1k, state.CostSamples
+	accountMu.Unlock()
+	if samples != 2 || second <= first || second >= 3 {
+		t.Fatalf("EMA 后 per1k=%v samples=%d，期望介于 %v 与 3 之间", second, samples, first)
+	}
+}
+
+// 验证成本观测的 TTL：过期观测降回未知层（tier 1），不再按免费/收费偏置选号。
+func TestModelCostTTLExpiry(t *testing.T) {
+	now := time.Now()
+	stale := &modelRuntimeState{CostClass: modelCostPaid, CostPer1k: 5, CostSamples: 2, ObservedAt: now.Add(-7 * time.Hour)}
+	if tier := modelCostTier(stale, now); tier != 1 {
+		t.Fatalf("过期收费观测 tier=%d want 1", tier)
+	}
+	fresh := &modelRuntimeState{CostClass: modelCostPaid, CostPer1k: 5, CostSamples: 2, ObservedAt: now.Add(-time.Hour)}
+	if tier := modelCostTier(fresh, now); tier != 2 {
+		t.Fatalf("新鲜收费观测 tier=%d want 2", tier)
+	}
+	staleFree := &modelRuntimeState{CostClass: modelCostFree, CostSamples: 1, ObservedAt: now.Add(-7 * time.Hour)}
+	if tier := modelCostTier(staleFree, now); tier != 1 {
+		t.Fatalf("过期免费观测 tier=%d want 1", tier)
+	}
+	if _, ok := modelCostPer1kOf(&Account{ModelStates: map[string]*modelRuntimeState{"m": stale}}, "m", now); ok {
+		t.Fatal("过期观测不应透出单价")
+	}
+	// 零余额账号 + 过期收费观测：回到受控探测路径（而不是永久屏蔽）
+	acc := &Account{QuotaExhausted: true, ModelStates: map[string]*modelRuntimeState{"m": stale}}
+	if kind, ok := usableForModelLocked(acc, "m", now); !ok || kind != selectionProbeExhausted {
+		t.Fatalf("过期观测应回到探测路径: kind=%s ok=%v", kind, ok)
+	}
+}
+
+// 验证成本分层选号：免费层 > 未知层 > 收费层；收费层内单价低者优先。
+func TestNextAccountForModelCostTierOrder(t *testing.T) {
+	oldInterval := cfg.CostExploreInterval
+	cfg.CostExploreInterval = 0
+	defer func() { cfg.CostExploreInterval = oldInterval }()
+
+	now := time.Now()
+	paid := &Account{Path: "paid.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10, ModelStates: map[string]*modelRuntimeState{
+		"m": {CostClass: modelCostPaid, CostPer1k: 5, CostSamples: 1, ObservedAt: now},
+	}}
+	paidCheap := &Account{Path: "paid-cheap.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10, ModelStates: map[string]*modelRuntimeState{
+		"m": {CostClass: modelCostPaid, CostPer1k: 1, CostSamples: 1, ObservedAt: now},
+	}}
+	unknown := &Account{Path: "unknown.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10}
+	free := &Account{Path: "free.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10, ModelStates: map[string]*modelRuntimeState{
+		"m": {CostClass: modelCostFree, CostSamples: 1, ObservedAt: now},
+	}}
+
+	accountMu.Lock()
+	accounts = []*Account{paid, unknown, free}
+	rrIndex = 0
+	accountMu.Unlock()
+	for i := range 2 {
+		acc, _, err := nextAccountForModel("m", nil)
+		if err != nil || acc.Path != "free.json" {
+			t.Fatalf("第 %d 次应选免费层账号: acc=%v err=%v", i+1, acc, err)
+		}
+	}
+
+	accountMu.Lock()
+	accounts = []*Account{paid, unknown}
+	rrIndex = 0
+	accountMu.Unlock()
+	acc, _, err := nextAccountForModel("m", nil)
+	if err != nil || acc.Path != "unknown.json" {
+		t.Fatalf("免费层缺失时应选未知层账号: acc=%v err=%v", acc, err)
+	}
+
+	accountMu.Lock()
+	accounts = []*Account{paid, paidCheap}
+	rrIndex = 0
+	accountMu.Unlock()
+	acc, _, err = nextAccountForModel("m", nil)
+	if err != nil || acc.Path != "paid-cheap.json" {
+		t.Fatalf("只剩收费层时应选单价低者: acc=%v err=%v", acc, err)
+	}
+}
+
+// 验证 costTier 条件探索：免费层垄断时按窗口改道一次给未知账号；窗口内不重复。
+func TestCostExploreRedirectsToUnknown(t *testing.T) {
+	oldInterval := cfg.CostExploreInterval
+	oldLast := costExploreLast
+	cfg.CostExploreInterval = time.Hour
+	accountMu.Lock()
+	costExploreLast = map[string]time.Time{}
+	accountMu.Unlock()
+	defer func() {
+		cfg.CostExploreInterval = oldInterval
+		accountMu.Lock()
+		costExploreLast = oldLast
+		accountMu.Unlock()
+	}()
+
+	free := &Account{Path: "free.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10, ModelStates: map[string]*modelRuntimeState{
+		"m": {CostClass: modelCostFree, CostSamples: 1, ObservedAt: time.Now()},
+	}}
+	unknown := &Account{Path: "unknown.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10}
+
+	accountMu.Lock()
+	accounts = []*Account{free, unknown}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	acc, _, err := nextAccountForModel("m", nil)
+	if err != nil || acc.Path != "unknown.json" {
+		t.Fatalf("窗口到期应改道未知账号: acc=%v err=%v", acc, err)
+	}
+	acc, _, err = nextAccountForModel("m", nil)
+	if err != nil || acc.Path != "free.json" {
+		t.Fatalf("窗口内应回到免费账号: acc=%v err=%v", acc, err)
+	}
+
+	// 窗口回拨后再次改道
+	accountMu.Lock()
+	costExploreLast["m"] = time.Now().Add(-2 * time.Hour)
+	accountMu.Unlock()
+	acc, _, err = nextAccountForModel("m", nil)
+	if err != nil || acc.Path != "unknown.json" {
+		t.Fatalf("窗口再次到期应改道: acc=%v err=%v", acc, err)
+	}
+}
+
+// 验证 -cost-explore-interval 0 完全关停探索（回到纯成本分层行为）。
+func TestCostExploreDisabledByZero(t *testing.T) {
+	oldInterval := cfg.CostExploreInterval
+	cfg.CostExploreInterval = 0
+	defer func() { cfg.CostExploreInterval = oldInterval }()
+
+	free := &Account{Path: "free.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10, ModelStates: map[string]*modelRuntimeState{
+		"m": {CostClass: modelCostFree, CostSamples: 1, ObservedAt: time.Now()},
+	}}
+	unknown := &Account{Path: "unknown.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10}
+	accountMu.Lock()
+	accounts = []*Account{free, unknown}
+	rrIndex = 0
+	accountMu.Unlock()
+	for i := range 2 {
+		acc, _, err := nextAccountForModel("m", nil)
+		if err != nil || acc.Path != "free.json" {
+			t.Fatalf("探索关停时第 %d 次应选免费账号: acc=%v err=%v", i+1, acc, err)
+		}
+	}
+}
+
+// 验证探索改道到受控探测账号时的独立类型：失败按常规轮转回退，不走纯探测短路。
+func TestCostExploreProbeKind(t *testing.T) {
+	oldInterval := cfg.CostExploreInterval
+	oldLast := costExploreLast
+	cfg.CostExploreInterval = time.Hour
+	accountMu.Lock()
+	costExploreLast = map[string]time.Time{}
+	accountMu.Unlock()
+	defer func() {
+		cfg.CostExploreInterval = oldInterval
+		accountMu.Lock()
+		costExploreLast = oldLast
+		accountMu.Unlock()
+	}()
+
+	free := &Account{Path: "free.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10, ModelStates: map[string]*modelRuntimeState{
+		"m": {CostClass: modelCostFree, CostSamples: 1, ObservedAt: time.Now()},
+	}}
+	exhausted := &Account{Path: "exhausted.json", Auth: &StoredAuth{}, QuotaExhausted: true}
+
+	accountMu.Lock()
+	accounts = []*Account{free, exhausted}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	acc, kind, err := nextAccountForModel("m", nil)
+	if err != nil || acc.Path != "exhausted.json" || kind != selectionExploreProbe {
+		t.Fatalf("探索应改道耗尽账号且类型为 explore_probe: acc=%v kind=%s err=%v", acc, kind, err)
+	}
+	accountMu.Lock()
+	nextProbe := exhausted.ModelStates["m"].NextProbeAt
+	accountMu.Unlock()
+	if nextProbe.IsZero() {
+		t.Fatal("搭车探测应置位 NextProbeAt（探测节流同样生效）")
+	}
+
+	// 模拟改道账号失败（已进 attempted）：下一轮应回退免费层账号。
+	acc, _, err = nextAccountForModel("m", map[*Account]bool{exhausted: true})
+	if err != nil || acc.Path != "free.json" {
+		t.Fatalf("探索失败后应回退免费层: acc=%v err=%v", acc, err)
+	}
+}
+
+// 验证搭车学习在探测失败（需付费额度）时不短路 503，而是回退免费层完成请求。
+func TestCostExploreProbeFailureFallsBack(t *testing.T) {
+	chdirTemp(t)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if strings.Contains(r.Header.Get("Authorization"), "exhausted-token") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"data":{"code":14018,"msg":"额度已用尽"}}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":500}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	oldInterval := cfg.CostExploreInterval
+	oldLast := costExploreLast
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	free := &Account{Path: "free.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "free-token", ExpiresAt: time.Now().Add(time.Hour).Unix()}}, QuotaKnown: true, QuotaRemaining: 10,
+		ModelStates: map[string]*modelRuntimeState{"explore-model": {CostClass: modelCostFree, CostSamples: 1, ObservedAt: time.Now()}}}
+	exhausted := &Account{Path: "exhausted.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "exhausted-token", ExpiresAt: time.Now().Add(time.Hour).Unix()}}, QuotaExhausted: true}
+	accounts, rrIndex = []*Account{free, exhausted}, 0
+	costExploreLast = map[string]time.Time{}
+	accountMu.Unlock()
+	cfg.CostExploreInterval = time.Hour
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		cfg.CostExploreInterval = oldInterval
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		costExploreLast = oldLast
+		accountMu.Unlock()
+	}()
+
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldWriter)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"explore-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("探索失败应回退完成请求而非 503: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("calls=%d want 2（搭车探测 1 + 回退 1）", calls)
+	}
+	accountMu.Lock()
+	blocked := exhausted.ModelStates["explore-model"] != nil && exhausted.ModelStates["explore-model"].QuotaBlocked
+	accountMu.Unlock()
+	if !blocked {
+		t.Fatal("搭车探测失败应标记该账号该模型额度阻断")
+	}
+	text := logs.String()
+	if !strings.Contains(text, "搭车学习失败") || !strings.Contains(text, "回退常规选号") {
+		t.Fatalf("缺少探索回退日志:\n%s", text)
+	}
+}
+
+// 验证成本账本随状态快照持久化并在重启后恢复（含 EMA 值与样本数）。
+func TestModelCostSnapshotRoundTrip(t *testing.T) {
+	chdirTemp(t)
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{{Path: "rt.json", Auth: &StoredAuth{}, ModelStates: map[string]*modelRuntimeState{
+		"free-m": {CostClass: modelCostFree, CostSamples: 2, ObservedAt: time.Now()},
+		"paid-m": {CostClass: modelCostPaid, CostPer1k: 2.5, CostSamples: 3, ObservedAt: time.Now()},
+	}}}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	writeStatusSnapshot()
+	accountMu.Lock()
+	accounts[0].ModelStates = nil
+	restoreAccountRuntimeStateLocked()
+	states := accounts[0].ModelStates
+	accountMu.Unlock()
+	if len(states) != 2 {
+		t.Fatalf("账本恢复失败: %+v", states)
+	}
+	if got := states["free-m"]; got == nil || got.CostClass != modelCostFree || got.CostSamples != 2 {
+		t.Fatalf("免费观测恢复不一致: %+v", got)
+	}
+	if got := states["paid-m"]; got == nil || got.CostClass != modelCostPaid || got.CostPer1k != 2.5 || got.CostSamples != 3 {
+		t.Fatalf("收费观测恢复不一致: %+v", got)
+	}
+}
+
+// 验证 status 账本摘要：免费在前、收费按单价升序、过期观测不展示。
+func TestFormatModelCostLedger(t *testing.T) {
+	now := time.Now()
+	acc := &Account{Path: "l.json", Auth: &StoredAuth{}, ModelStates: map[string]*modelRuntimeState{
+		"a-free":  {CostClass: modelCostFree, CostSamples: 3, ObservedAt: now},
+		"b-paid":  {CostClass: modelCostPaid, CostPer1k: 2.5, CostSamples: 1, ObservedAt: now},
+		"c-stale": {CostClass: modelCostPaid, CostPer1k: 9, CostSamples: 1, ObservedAt: now.Add(-7 * time.Hour)},
+	}}
+	got := formatModelCostLedger(acc, now)
+	if !strings.Contains(got, "2 个模型（免费 1 / 收费 1）") {
+		t.Fatalf("账本摘要头部不符: %s", got)
+	}
+	if !strings.Contains(got, "a-free") || !strings.Contains(got, "2.5000/1k") {
+		t.Fatalf("账本摘要缺少条目: %s", got)
+	}
+	if strings.Contains(got, "c-stale") {
+		t.Fatalf("过期观测不应展示: %s", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Phase 4：多代理池（账号稳定绑定 + 客户端路由）
+// -----------------------------------------------------------------------------
+
+// 验证账号按凭据文件名稳定绑定到代理池成员：同文件恒同出口、目录无关。
+func TestBoundProxyURLStableByFileName(t *testing.T) {
+	old := cfg.ProxyURLs
+	cfg.ProxyURLs = []string{"http://p1:1", "http://p2:2", "http://p3:3"}
+	defer func() { cfg.ProxyURLs = old }()
+
+	a1 := &Account{Path: "workbuddy-intl3.json"}
+	a2 := &Account{Path: "workbuddy-intl3.json"}
+	if got := boundProxyURL(a1); got == "" || got != boundProxyURL(a2) {
+		t.Fatalf("同文件名应稳定绑定: %q vs %q", got, boundProxyURL(a2))
+	}
+	a3 := &Account{Path: "/opt/workbuddy/workbuddy-intl3.json"}
+	if boundProxyURL(a1) != boundProxyURL(a3) {
+		t.Fatalf("绑定应只取文件名（部署目录无关）: %q vs %q", boundProxyURL(a1), boundProxyURL(a3))
+	}
+	cfg.ProxyURLs = nil
+	if boundProxyURL(a1) != "" {
+		t.Fatal("未配置代理池应返回空绑定")
+	}
+}
+
+// 验证客户端路由：未配置/未构建/找不到池成员时回退全局客户端。
+func TestClientForAccountFallsBack(t *testing.T) {
+	oldClient := cfg.HttpClient
+	oldURLs := cfg.ProxyURLs
+	oldClients := proxyClients
+	defer func() {
+		cfg.HttpClient = oldClient
+		cfg.ProxyURLs = oldURLs
+		proxyClients = oldClients
+	}()
+
+	global := &http.Client{}
+	cfg.HttpClient = global
+	cfg.ProxyURLs = nil
+	proxyClients = map[string]*http.Client{}
+	if clientForAccount(&Account{Path: "x.json"}) != global {
+		t.Fatal("未配置代理池应回退全局客户端")
+	}
+	if clientForAccount(nil) != global {
+		t.Fatal("nil 账号应回退全局客户端")
+	}
+
+	cfg.ProxyURLs = []string{"http://p1:1"}
+	if clientForAccount(&Account{Path: "x.json"}) != global {
+		t.Fatal("池客户端未构建时应回退全局客户端")
+	}
+
+	pool := &http.Client{}
+	proxyClients = map[string]*http.Client{"http://p1:1": pool}
+	if clientForAccount(&Account{Path: "x.json"}) != pool {
+		t.Fatal("已构建池客户端应命中绑定客户端")
 	}
 }

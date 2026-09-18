@@ -267,10 +267,10 @@ func modelServableLocked(acc *Account, model string, now time.Time) bool {
 	if !acc.QuotaExhausted {
 		return true
 	}
-	switch state.CostClass {
-	case modelCostFree:
+	switch modelCostTier(state, now) {
+	case 0:
 		return true
-	case modelCostPaid:
+	case 2:
 		return false
 	default:
 		return !now.Before(state.NextProbeAt)
