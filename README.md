@@ -848,8 +848,8 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o d
 ```bash
 # 1. bump main.go 中的 version 常量
 # 2. 提交后打 tag 并推送
-git commit -am "chore: bump version to 1.13.0"
-git tag -a v1.13.0 -m "WorkBuddy Local Gateway v1.13.0"
+git commit -am "chore: bump version to 1.14.0"
+git tag -a v1.14.0 -m "WorkBuddy Local Gateway v1.14.0"
 git push origin main --follow-tags
 ```
 
