@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -3306,7 +3307,16 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
 		prof := acc.Profile()
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(currentBody))
+		// prompt_cache_key 注入（费用优化，费用降约 17 倍）：必须在轮转循环内按
+		// **当前账号**计算——键里带账号 UID 隔离段，跨账号复用会命中他人前缀缓存
+		// 并泄露对话内容。同一账号内的换号重试复用同键（uid 相同、会话相同 → 同键），
+		// 因此只在首次尝试后缓存：本循环每轮都要为不同账号重算。
+		reqBody := currentBody
+		if acc.Auth != nil {
+			reqBody = injectPromptCacheKey(currentBody, acc.Auth.Account.UID, conversationID)
+		}
+
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(reqBody))
 		if err != nil {
 			recordModelFailure(modelName, "req_create_error")
 			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
@@ -3906,6 +3916,67 @@ func sanitizeMessages(obj map[string]any) {
 			sanitizeToolCalls(tc)
 		}
 	}
+}
+
+// injectPromptCacheKey 注入上游 prompt_cache_key 字段（前缀缓存复用，费用优化）。
+//
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/upstream/cache_key.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。逆向实测：同一段 8k token 前缀，
+// 不带该字段时 prompt_cache_hit_tokens=0、credit≈0.34；带上后
+// prompt_cache_hit_tokens=7808、credit≈0.02（费用降约 17 倍）。
+//
+// 键格式 `wbgw-<uid8>-<convHex>`：
+//   - uid8 是账号 UID 前 8 字符，提供**跨账号硬隔离**——跨账号复用同一 cache key
+//     会让上游命中他人前缀缓存、泄露对方对话内容，故 uid 是不可省略的隔离因子；
+//   - convHex = sha256(uid + "|" + 会话标识) 前 16 字节的 hex，同账号同会话稳定、
+//     不同会话不同。会话源为空时仍由 uid 单独哈希：跨账号绝不碰撞，但空会话不复用
+//     （空会话 = 新会话语义，本就不该命中旧前缀）。
+//
+// 优先级：客户端已显式携带 prompt_cache_key → 原值保留，绝不覆盖（客户端自知
+// 复用哪个键）；否则 body 里的 conversation_id / conversationId 优先于入站参数。
+//
+// 与本仓库的会话头族配套：conversationID 由 resolveConversationID 从请求体提取，
+// 与 X-Conversation-ID 同源，保证「同一对话轮」在头与体两处口径一致。
+// body 不可解析时原样返回（坏 body 不二次错误化，交由后续上游分类处理）。
+func injectPromptCacheKey(body []byte, uid, conversationID string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	// 优先级 1：客户端已显式带 key → 绝不覆盖。
+	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {
+		return body
+	}
+	// 优先级 2：body 内的会话标识优先于入站参数。
+	conv := conversationID
+	if v, ok := obj["conversation_id"].(string); ok && strings.TrimSpace(v) != "" {
+		conv = strings.TrimSpace(v)
+	} else if v, ok := obj["conversationId"].(string); ok && strings.TrimSpace(v) != "" {
+		conv = strings.TrimSpace(v)
+	}
+	obj["prompt_cache_key"] = buildPromptCacheKey(uid, conv)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// buildPromptCacheKey 生成 `wbgw-<uid8>-<convHex>` 格式的稳定 cache key。
+// 见 injectPromptCacheKey 的隔离语义说明。
+func buildPromptCacheKey(uid, conversation string) string {
+	uid8 := uid
+	if len(uid8) > 8 {
+		uid8 = uid8[:8]
+	}
+	if uid8 == "" {
+		uid8 = "-"
+	}
+	sum := sha256.Sum256([]byte(uid + "|" + conversation))
+	return "wbgw-" + uid8 + "-" + hex.EncodeToString(sum[:16])
 }
 
 // ensureLeadingSystemMessage 保证 messages 的首条消息符合腾讯上游的会话结构校验。

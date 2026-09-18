@@ -1838,6 +1838,142 @@ func TestSanitizeMessagesMultimodalContent(t *testing.T) {
 // 会话头族测试
 // -----------------------------------------------------------------------------
 
+// 验证 prompt_cache_key 注入：同账号同会话稳定、跨账号隔离、跨会话区分。
+func TestInjectPromptCacheKeyStabilityAndIsolation(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	keyOf := func(t *testing.T, in []byte) string {
+		t.Helper()
+		var obj map[string]any
+		if err := json.Unmarshal(injectPromptCacheKey(in, "uid-aaaaaaaa", "conv-1"), &obj); err != nil {
+			t.Fatalf("注入后不可解析: %v", err)
+		}
+		k, _ := obj["prompt_cache_key"].(string)
+		return k
+	}
+
+	k1 := keyOf(t, body)
+	if k1 == "" {
+		t.Fatal("应注入 prompt_cache_key")
+	}
+	// 同账号同会话：稳定
+	if k2 := keyOf(t, body); k2 != k1 {
+		t.Fatalf("同账号同会话应稳定: %q vs %q", k1, k2)
+	}
+	// 键格式：wbgw-<uid8>-<32hex>
+	if !strings.HasPrefix(k1, "wbgw-uid-aaaa-") || len(k1) != len("wbgw-uid-aaaa-")+32 {
+		t.Fatalf("键格式不符: %q", k1)
+	}
+
+	// 跨账号必须隔离——否则会命中他人前缀缓存、泄露对话内容
+	var other map[string]any
+	_ = json.Unmarshal(injectPromptCacheKey(body, "uid-bbbbbbbb", "conv-1"), &other)
+	if other["prompt_cache_key"] == k1 {
+		t.Fatal("不同账号必须生成不同键（跨账号缓存命中会泄露对话）")
+	}
+	// 同账号跨会话：区分
+	var otherConv map[string]any
+	_ = json.Unmarshal(injectPromptCacheKey(body, "uid-aaaaaaaa", "conv-2"), &otherConv)
+	if otherConv["prompt_cache_key"] == k1 {
+		t.Fatal("同账号不同会话应生成不同键")
+	}
+}
+
+// 验证注入优先级与边界：客户端显式键不覆盖；body 内会话标识优先于入站参数；
+// 空 body / 坏 JSON / 无 UID 时行为确定。
+func TestInjectPromptCacheKeyPrecedenceAndEdges(t *testing.T) {
+	// 客户端已显式带 key → 原值保留，且返回原切片（不做无谓重编码）
+	explicit := []byte(`{"prompt_cache_key":"client-key","model":"m"}`)
+	got := injectPromptCacheKey(explicit, "uid-aaaaaaaa", "conv-1")
+	var obj map[string]any
+	_ = json.Unmarshal(got, &obj)
+	if obj["prompt_cache_key"] != "client-key" {
+		t.Fatalf("不应覆盖客户端显式键: %v", obj["prompt_cache_key"])
+	}
+
+	// body 内 conversation_id 优先于入站参数
+	inBody := []byte(`{"conversation_id":"from-body","model":"m"}`)
+	var a, b map[string]any
+	_ = json.Unmarshal(injectPromptCacheKey(inBody, "uid-aaaaaaaa", "from-arg"), &a)
+	_ = json.Unmarshal(injectPromptCacheKey(inBody, "uid-aaaaaaaa", "from-body"), &b)
+	if a["prompt_cache_key"] != b["prompt_cache_key"] {
+		t.Fatalf("body 内会话标识应优先于入站参数: %v vs %v", a["prompt_cache_key"], b["prompt_cache_key"])
+	}
+
+	// 空 body 原样返回
+	if got := injectPromptCacheKey(nil, "uid-aaaaaaaa", "c"); got != nil {
+		t.Fatal("空 body 应原样返回")
+	}
+	// 坏 JSON 原样返回（不二次错误化）
+	bad := []byte(`{not json`)
+	if got := injectPromptCacheKey(bad, "uid-aaaaaaaa", "c"); string(got) != string(bad) {
+		t.Fatal("坏 JSON 应原样返回")
+	}
+	// 空 UID：仍注入，但隔离段为占位符（保证跨账号不碰撞的语义退化可见）
+	var noUID map[string]any
+	_ = json.Unmarshal(injectPromptCacheKey([]byte(`{"model":"m"}`), "", "c"), &noUID)
+	if k, _ := noUID["prompt_cache_key"].(string); !strings.HasPrefix(k, "wbgw---") {
+		t.Fatalf("空 UID 应使用占位隔离段: %q", k)
+	}
+}
+
+// 验证注入在真实请求链路上生效：上游收到的 body 带 prompt_cache_key，且按账号隔离。
+func TestUpstreamChatInjectsPromptCacheKey(t *testing.T) {
+	chdirTemp(t)
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":500}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	acc := &Account{Path: "ck.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		Account: StoredAccount{UID: "uid-aaaaaaaa"}}}
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"conversation_id":"conv-xyz","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("上游应收到 1 次请求, got %d", len(bodies))
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(bodies[0]), &sent); err != nil {
+		t.Fatalf("上游收到的 body 不可解析: %v", err)
+	}
+	key, _ := sent["prompt_cache_key"].(string)
+	if !strings.HasPrefix(key, "wbgw-uid-aaaa-") {
+		t.Fatalf("上游未收到按账号隔离的 cache key: %q", key)
+	}
+	// 会话标识来自 body（conv-xyz），与直接调用同源应得同键
+	var direct map[string]any
+	_ = json.Unmarshal(injectPromptCacheKey([]byte(bodies[0]), "uid-aaaaaaaa", "conv-xyz"), &direct)
+	if direct["prompt_cache_key"] != key {
+		t.Fatalf("链路上的键应与同源直算一致: %v vs %v", key, direct["prompt_cache_key"])
+	}
+}
+
 // 验证消息级 ID 形态：32 hex（对齐官方 X-Request-ID / X-Conversation-Message-ID）
 func TestNewMessageID(t *testing.T) {
 	seen := make(map[string]bool)

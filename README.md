@@ -41,6 +41,8 @@
 | `a9be76a` | 会话头族 + 内容拦截降级重试 | 移植 wb2api 的 `X-Conversation-Request-ID` 与降级重试思路 |
 | `df4556c` | 成本账本分层选号 + 多代理池 | 移植 wb2api 的 costTier 与 issue #136 方案 a′ |
 | `8abcaf3` | CI：推送 tag 自动发布 Linux 产物 | 本仓库新增 |
+| `b58ecea` | 文档：代码来源与 MIT 署名 | 本仓库新增 |
+| 待提交 | `prompt_cache_key` 前缀缓存复用（费用降约 17 倍） | 移植 wb2api 的 `cache_key.go`（MIT） |
 
 设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
 
@@ -69,6 +71,8 @@
 | `hasBusinessEnvelope` | `internal/upstream/client.go` | 逐字相同 |
 | `isWafBlocked` | 同上（原名 `IsWafBlocked`） | 95.9%（仅改名与注释裁剪） |
 | `nextMidnightCST` | `internal/server/degrade.go` | 逐字相同（仅删去一行注释） |
+| `injectPromptCacheKey` | `internal/upstream/cache_key.go`（原名 `InjectPromptCacheKey`） | 53.8%（同结构改写：内联 `strField` 为 TrimSpace、键前缀改 `wbgw-`） |
+| `buildPromptCacheKey` | 同上（原名 `buildCacheKey`） | 84.0%（仅改键前缀与函数名） |
 
 其余移植项（`errKind` 分类体系、成本分层选号、会话头族、内容拦截降级、多代理池）
 为**按设计思路的裁剪重实现**，非逐字复制：结构对齐 wb2api 的调度语义，
@@ -177,6 +181,7 @@
 - **成本账本与分层选号**：每次成功请求按 `usage.credit` 折算每千 token 单价（EMA α=0.3 平滑、6 小时过期）记入「账号 + 模型」账本；选号时按 **免费 > 未知 > 收费** 硬过滤分层，收费层内单价低者优先，避免把流量浪费在贵号上。
 - ✦ **成本条件探索（反垄断）**：免费层账号垄断某模型时，未知层账号永远轮不到、也就永远学不到属性。默认每 30 分钟（`-cost-explore-interval`，0 关停）把**一次真实用户请求**改道给未知账号搭车学习——零新增上游调用，学成即毕业；探索失败自动回退，不影响本次请求。（移植 wb2api issue #136 方案 a′）
 - ✦ **多代理池**：`-proxies` 配置多个出口代理，账号按凭据文件名稳定散列绑定到其中一个出口 IP，单 IP 风控不再同时命中全部账号。
+- ✦ **前缀缓存复用（费用优化）**：出站请求注入 `prompt_cache_key`，让同一客户端对同一账号的连续请求命中上游前缀缓存——实测同一段 8k token 前缀，命中后 `credit` 从 ≈0.34 降到 ≈0.02（**费用降约 17 倍**）。键按账号 UID 硬隔离（`wbgw-<uid8>-<会话哈希>`），跨账号绝不碰撞（否则会命中他人缓存、泄露对话内容）；客户端已显式携带该字段时原值保留不覆盖。（移植 wb2api 的 `cache_key.go`）
 - **国内站每日自动签到**：服务启动、凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；国际站跳过。
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
 - **授权失效自动禁用**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复；**WAF 形态的 403 不在此列**。
