@@ -73,10 +73,17 @@
 | `nextMidnightCST` | `internal/server/degrade.go` | 逐字相同（仅删去一行注释） |
 | `injectPromptCacheKey` | `internal/upstream/cache_key.go`（原名 `InjectPromptCacheKey`） | 53.8%（同结构改写：内联 `strField` 为 TrimSpace、键前缀改 `wbgw-`） |
 | `buildPromptCacheKey` | 同上（原名 `buildCacheKey`） | 84.0%（仅改键前缀与函数名） |
+| `repackToolResultBlocks` / `cleanupOrphanToolCalls` | `internal/upstream/tool_pairing.go` | 逐字相同（含注释） |
 
 其余移植项（`errKind` 分类体系、成本分层选号、会话头族、内容拦截降级、多代理池）
 为**按设计思路的裁剪重实现**，非逐字复制：结构对齐 wb2api 的调度语义，
 但按基线的串行架构重写，函数名、数据流与判定顺序均不同。
+
+**移植时的适配差异**（本仓库基线的既有行为必须保留）：
+
+- `normalizeToolPairing` 排在 `ensureLeadingSystemMessage` **之后**。基线会把后续出现的
+  system/developer 消息提升到首位（11-128 修复），而 repack 刚把夹在 tool 结果中间的
+  developer 挪到结果之后——若顺序颠倒，提升动作会把它搬回前面，配对重新断裂。
 
 > **MIT 许可声明**：本仓库包含来自 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的代码，
 > 版权归其作者所有，依 MIT 许可使用：
@@ -182,6 +189,7 @@
 - ✦ **成本条件探索（反垄断）**：免费层账号垄断某模型时，未知层账号永远轮不到、也就永远学不到属性。默认每 30 分钟（`-cost-explore-interval`，0 关停）把**一次真实用户请求**改道给未知账号搭车学习——零新增上游调用，学成即毕业；探索失败自动回退，不影响本次请求。（移植 wb2api issue #136 方案 a′）
 - ✦ **多代理池**：`-proxies` 配置多个出口代理，账号按凭据文件名稳定散列绑定到其中一个出口 IP，单 IP 风控不再同时命中全部账号。
 - ✦ **前缀缓存复用（费用优化）**：出站请求注入 `prompt_cache_key`，让同一客户端对同一账号的连续请求命中上游前缀缓存——实测同一段 8k token 前缀，命中后 `credit` 从 ≈0.34 降到 ≈0.02（**费用降约 17 倍**）。键按账号 UID 硬隔离（`wbgw-<uid8>-<会话哈希>`），跨账号绝不碰撞（否则会命中他人缓存、泄露对话内容）；客户端已显式携带该字段时原值保留不覆盖。（移植 wb2api 的 `cache_key.go`）
+- ✦ **tool 配对自愈**：出站前对 `messages` 做两步归一化——**重排**（把夹在 tool 结果中间的非 tool 消息挪到整组之后）与**清理**（按 id 对称剔除无结果的 `tool_call` 与无调用的 `tool` 结果）。工具执行失败时客户端会把 `tool_calls` 写进历史却写不回结果，这条坏历史每次重放都让上游返回 400（`11148`）**顶死整条会话**；Codex 的 `image_resize_notice` 插在并行结果中间同样判配对断裂。网关是最后一道防线：宁可丢一轮工具上下文，也好过会话报废。（移植 wb2api 的 `tool_pairing.go`）
 - **国内站每日自动签到**：服务启动、凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；国际站跳过。
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
 - **授权失效自动禁用**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复；**WAF 形态的 403 不在此列**。

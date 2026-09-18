@@ -1835,6 +1835,379 @@ func TestSanitizeMessagesMultimodalContent(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// tool 配对归一化测试
+// -----------------------------------------------------------------------------
+
+// 验证无工具流量时零改动（返回原 slice，不新分配）。
+func TestCleanupOrphanNoTraffic(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "system", "content": "hi"},
+		map[string]any{"role": "user", "content": "hello"},
+		map[string]any{"role": "assistant", "content": "hi there"},
+	}
+	out, changed := cleanupOrphanToolCalls(messages)
+	if changed {
+		t.Fatal("无工具流量不应改动")
+	}
+	if len(out) != len(messages) || &out[0] != &messages[0] {
+		t.Fatal("零改动应返回原 slice")
+	}
+}
+
+// 验证孤儿 tool_call（无结果）被删除——工具执行失败的会话历史会让上游顶死整条会话。
+func TestCleanupOrphanToolCallWithoutResult(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
+			map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "Grep", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "user", "content": "continue"},
+	}
+	out, changed := cleanupOrphanToolCalls(messages)
+	if !changed {
+		t.Fatal("孤儿 tool_call 应被清理")
+	}
+	if _, ok := out[0].(map[string]any)["tool_calls"]; ok {
+		t.Fatalf("tool_calls 键应被删除: %#v", out[0])
+	}
+}
+
+// 验证部分配对按 keepCalls 对称裁剪：批 [c1,c2] 只有 c1 有结果 → 调用侧只留 c1。
+// 若整批保留或整批删除，都会留下半截配对，上游判 11148。
+func TestCleanupOrphanPartialBatch(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "read", "arguments": "{}"}},
+			map[string]any{"id": "c2", "type": "function", "function": map[string]any{"name": "read", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "ok"},
+		map[string]any{"role": "user", "content": "next"},
+	}
+	out, changed := cleanupOrphanToolCalls(messages)
+	if !changed {
+		t.Fatal("部分配对应被裁剪")
+	}
+	tcs, _ := out[0].(map[string]any)["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("调用侧应只留 c1: %#v", tcs)
+	}
+	if id, _ := tcs[0].(map[string]any)["id"].(string); id != "c1" {
+		t.Fatalf("保留的应是 c1: %q", id)
+	}
+}
+
+// 验证孤儿 tool 结果（无对应调用）整条删除。
+func TestCleanupOrphanResultOnly(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "user", "content": "hi"},
+		map[string]any{"role": "tool", "tool_call_id": "ghost", "content": "orphan"},
+		map[string]any{"role": "user", "content": "next"},
+	}
+	out, changed := cleanupOrphanToolCalls(messages)
+	if !changed {
+		t.Fatal("孤儿结果应被清理")
+	}
+	for _, m := range out {
+		if role, _ := m.(map[string]any)["role"].(string); role == "tool" {
+			t.Fatalf("孤儿 tool 结果应整条删除: %#v", out)
+		}
+	}
+}
+
+// 验证合法配对原样保留（安全网绝不吞掉正确配对）。
+func TestCleanupOrphanPairingPreserved(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "ok"},
+	}
+	out, changed := cleanupOrphanToolCalls(messages)
+	if changed {
+		t.Fatal("合法配对不应改动")
+	}
+	if len(out) != 2 {
+		t.Fatalf("消息数不应变化: %d", len(out))
+	}
+}
+
+// 验证乱序（tool 结果先于调用出现）与重复 id 按集合处理，不误删。
+func TestCleanupOrphanOutOfOrderAndDuplicate(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "early"},
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
+		}},
+	}
+	out, changed := cleanupOrphanToolCalls(messages)
+	if changed {
+		t.Fatalf("双侧齐全（乱序 + 重复 id）不应改动: %#v", out)
+	}
+}
+
+// 验证结果块重排：夹在两条 tool 结果之间的 developer 消息被挪到整组之后，只调顺序不改内容。
+func TestRepackToolResultBlocksInsertedNotice(t *testing.T) {
+	notice := "<image_resize_notice>resized</image_resize_notice>"
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "c00", "type": "function", "function": map[string]any{"name": "view_image", "arguments": "{}"}},
+			map[string]any{"id": "c01", "type": "function", "function": map[string]any{"name": "view_image", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "c00", "content": "img0"},
+		map[string]any{"role": "developer", "content": notice},
+		map[string]any{"role": "tool", "tool_call_id": "c01", "content": "img1"},
+		map[string]any{"role": "user", "content": "next"},
+	}
+	out, changed := repackToolResultBlocks(messages)
+	if !changed {
+		t.Fatal("插入物应触发重排")
+	}
+	if len(out) != 5 {
+		t.Fatalf("消息数不应变化，实际 %d", len(out))
+	}
+	wantRoles := []string{"assistant", "tool", "tool", "developer", "user"}
+	for i, w := range wantRoles {
+		got, _ := out[i].(map[string]any)["role"].(string)
+		if got != w {
+			t.Fatalf("out[%d] 角色应为 %s，实际 %s", i, w, got)
+		}
+	}
+	if out[3].(map[string]any)["content"] != notice {
+		t.Fatalf("插入物内容被改动: %#v", out[3])
+	}
+	if id, _ := out[1].(map[string]any)["tool_call_id"].(string); id != "c00" {
+		t.Fatalf("第一份结果应为 c00，实际 %s", id)
+	}
+	if id, _ := out[2].(map[string]any)["tool_call_id"].(string); id != "c01" {
+		t.Fatalf("第二份结果应为 c01，实际 %s", id)
+	}
+}
+
+// 验证完整连续配对时零改动（返回原 slice）。
+func TestRepackToolResultBlocksNoInsert(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "r"},
+		map[string]any{"role": "user", "content": "n"},
+	}
+	out, changed := repackToolResultBlocks(messages)
+	if changed {
+		t.Fatal("完整配对不应改动")
+	}
+	if &out[0] != &messages[0] {
+		t.Fatal("零改动应返回原 slice")
+	}
+}
+
+// 验证下一组 assistant.tool_calls 不被上一组的收集循环吞掉（真实会话回归形态）：
+// 若被吞掉，它自己那批结果永远得不到重排，上游照旧判 11148。
+func TestRepackToolResultBlocksNextGroupHeadNotSwallowed(t *testing.T) {
+	msgs := []any{
+		map[string]any{"role": "user", "content": "go"},
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+			map[string]any{"id": "c00", "type": "function", "function": map[string]any{"name": "exec_command", "arguments": "{}"}},
+			map[string]any{"id": "c01", "type": "function", "function": map[string]any{"name": "exec_command", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "c00", "content": "ok0"},
+		map[string]any{"role": "tool", "tool_call_id": "c01", "content": "ok1"},
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+			map[string]any{"id": "c10", "type": "function", "function": map[string]any{"name": "view_image", "arguments": "{}"}},
+			map[string]any{"id": "c11", "type": "function", "function": map[string]any{"name": "view_image", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "c10", "content": "img0"},
+		map[string]any{"role": "developer", "content": "<image_resize_notice>n"},
+		map[string]any{"role": "tool", "tool_call_id": "c11", "content": "img1"},
+		map[string]any{"role": "developer", "content": "<image_resize_notice>n"},
+	}
+	out, changed := repackToolResultBlocks(msgs)
+	if !changed {
+		t.Fatal("第二组应被重排")
+	}
+	if len(out) != len(msgs) {
+		t.Fatalf("长度变化：%d -> %d", len(msgs), len(out))
+	}
+	want := []string{"", "", "c00", "c01", "", "c10", "c11", "", ""}
+	for i, m := range out {
+		id, _ := m.(map[string]any)["tool_call_id"].(string)
+		if id != want[i] {
+			t.Fatalf("[%d] tool_call_id=%q，期望 %q", i, id, want[i])
+		}
+	}
+	assertToolPairsContiguous(t, out)
+}
+
+// 验证连续多组、仅末组含插入物时组头识别不退化。
+func TestRepackToolResultBlocksThreeConsecutiveGroups(t *testing.T) {
+	msgs := []any{
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+			map[string]any{"id": "a0", "type": "function", "function": map[string]any{"name": "x", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "a0", "content": "r"},
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+			map[string]any{"id": "b0", "type": "function", "function": map[string]any{"name": "x", "arguments": "{}"}},
+			map[string]any{"id": "b1", "type": "function", "function": map[string]any{"name": "x", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "b0", "content": "r"},
+		map[string]any{"role": "tool", "tool_call_id": "b1", "content": "r"},
+		map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+			map[string]any{"id": "c0", "type": "function", "function": map[string]any{"name": "x", "arguments": "{}"}},
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "x", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "c0", "content": "r"},
+		map[string]any{"role": "developer", "content": "<notice>"},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "r"},
+		map[string]any{"role": "developer", "content": "<notice>"},
+	}
+	out, changed := repackToolResultBlocks(msgs)
+	if !changed {
+		t.Fatal("末组应被重排")
+	}
+	if len(out) != len(msgs) {
+		t.Fatalf("长度变化：%d -> %d", len(msgs), len(out))
+	}
+	assertToolPairsContiguous(t, out)
+}
+
+// assertToolPairsContiguous 断言每个 assistant.tool_calls 的结果在其后连续出现。
+func assertToolPairsContiguous(t *testing.T, msgs []any) {
+	t.Helper()
+	for i := range msgs {
+		mm, _ := msgs[i].(map[string]any)
+		tcs, ok := mm["tool_calls"].([]any)
+		if !ok || len(tcs) == 0 {
+			continue
+		}
+		want := map[string]bool{}
+		for _, tci := range tcs {
+			if tc, ok := tci.(map[string]any); ok {
+				if id, _ := tc["id"].(string); id != "" {
+					want[id] = true
+				}
+			}
+		}
+		got := map[string]bool{}
+		for j := i + 1; j < len(msgs); j++ {
+			nxt, _ := msgs[j].(map[string]any)
+			if r, _ := nxt["role"].(string); r != "tool" {
+				break
+			}
+			if id, _ := nxt["tool_call_id"].(string); id != "" {
+				got[id] = true
+			}
+		}
+		if len(got) != len(want) {
+			t.Fatalf("assistant[%d] 结果不连续：want=%d got=%d", i, len(want), len(got))
+		}
+	}
+}
+
+// 验证端到端：真实卡死形态（多 tool 并行 + notice 夹在结果中间）经请求链路后
+// 出站载荷结果连续、配对对称——上游不再判 11148。
+func TestToolPairingEndToEndThroughChatHandler(t *testing.T) {
+	chdirTemp(t)
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":500}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	acc := &Account{Path: "tp.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		Account: StoredAccount{UID: "uid-aaaaaaaa"}}}
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	// 形态：一组正常配对 + 一组结果被 notice 打断 + 一个孤儿 tool_call
+	body := `{"model":"m","stream":true,"messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":"","tool_calls":[
+			{"id":"c00","type":"function","function":{"name":"exec_command","arguments":"{}"}},
+			{"id":"c01","type":"function","function":{"name":"exec_command","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c00","content":"ok0"},
+		{"role":"tool","tool_call_id":"c01","content":"ok1"},
+		{"role":"assistant","content":"","tool_calls":[
+			{"id":"i00","type":"function","function":{"name":"view_image","arguments":"{\"path\":\"a.png\"}"}},
+			{"id":"i01","type":"function","function":{"name":"view_image","arguments":"{\"path\":\"b.png\"}"}},
+			{"id":"orphan","type":"function","function":{"name":"missing","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"i00","content":"img0"},
+		{"role":"developer","content":"<image_resize_notice>resized</image_resize_notice>"},
+		{"role":"tool","tool_call_id":"i01","content":"img1"},
+		{"role":"user","content":"next"}
+	]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(got), &sent); err != nil {
+		t.Fatalf("上游收到的 body 不可解析: %v", err)
+	}
+	msgs := sent["messages"].([]any)
+	// 孤儿调用 orphan 被剔除（原 3 个 → 2 个）
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		if tcs, ok := mm["tool_calls"].([]any); ok {
+			for _, tci := range tcs {
+				if id, _ := tci.(map[string]any)["id"].(string); id == "orphan" {
+					t.Fatal("孤儿 tool_call 应被剔除")
+				}
+			}
+		}
+	}
+	// i00/i01 两条结果连续——notice 被 repack 挪出结果之间。
+	//
+	// 注意：notice 的最终位置不在此断言。它是 developer 消息，会被
+	// ensureLeadingSystemMessage 提升到首位并归一为 system（既有的 11-128 修复
+	// 行为）；关键不变量是「它不再夹在两条 tool 结果之间」，即下方连续性断言。
+	idx := -1
+	for i, m := range msgs {
+		if id, _ := m.(map[string]any)["tool_call_id"].(string); id == "i00" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("未找到 i00 结果")
+	}
+	if id, _ := msgs[idx+1].(map[string]any)["tool_call_id"].(string); id != "i01" {
+		t.Fatalf("i00 后应紧跟 i01，实际 %#v", msgs[idx+1])
+	}
+	// notice 不在结果之间：它要么在首位（被提升），要么在结果之后，绝不在 i00 与 i01 中间。
+	for i := idx + 1; i < len(msgs); i++ {
+		mm, _ := msgs[i].(map[string]any)
+		if role, _ := mm["role"].(string); role != "tool" {
+			break
+		}
+		if c, _ := mm["content"].(string); strings.Contains(c, "image_resize_notice") {
+			t.Fatalf("notice 仍夹在 tool 结果之间: %#v", msgs)
+		}
+	}
+	assertToolPairsContiguous(t, msgs)
+}
+
+// -----------------------------------------------------------------------------
 // 会话头族测试
 // -----------------------------------------------------------------------------
 

@@ -63,7 +63,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	applyThinkingRules(chatReq, modelName)
 	sanitizeMessages(chatReq)
+	// 顺序与 chat 入口一致：先做首条 system 归一化（它会把后续 system/developer
+	// 提升到首位），再做 tool 配对归一化（配对重排必须是最后一道改写）。
 	ensureLeadingSystemMessage(chatReq)
+	// tool 配对归一化：Responses API 的 function_call / function_call_output
+	// 转译后同样可能产生不成对的 tool_calls / tool 结果。
+	normalizeToolPairing(chatReq)
 
 	upstreamBytes, err := json.Marshal(chatReq)
 	if err != nil {
