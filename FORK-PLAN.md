@@ -179,3 +179,26 @@ func isWafBlocked(status int, body string) bool {
 
 - wbgw v1.11.0 運行中，2 帳號可用，Token 有效期至 2027
 - wb2api 已卸載（容器/映像/目錄全清），備份在 `/root/backups/wb2api-uninstall.tar.gz`
+
+## 部署記錄
+
+| 日期 | 提交 | 內容 | 伺服器備份名 |
+|---|---|---|---|
+| 2026-09-17 | `bd7b329` | Phase 1：WAF 403 與授權失效分流 | `workbuddy-gateway.v1.12.0-p1.bak` |
+| 2026-09-17 | `680a944` | Phase 2：錯誤分類體系（errKind） | `workbuddy-gateway.v1.12.0-p2.bak` |
+| 2026-09-18 | `9cee7a6` | Phase 3a：指紋脫敏修復 | `workbuddy-gateway.v1.12.0-p3a.bak` |
+| 2026-09-18 | `a9be76a` | Phase 3b：會話頭族 + 內容攔截降級重試 | `workbuddy-gateway.v1.12.0-p3b.bak` |
+| 2026-09-18 | `df4556c` | Phase 4：成本帳本分層選號 + 多代理池 | `workbuddy-gateway.v1.12.0-p3b.bak`（前版） |
+
+部署方式：本地 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`，
+經 SFTP 上傳至 `/tmp`，`sha256sum` 校驗後 `install -m 0755` + `mv` 原子替換，
+`systemctl restart workbuddy-gateway`。
+
+Phase 4 上線後驗證（2026-09-18 05:17 UTC）：
+
+- `status` 顯示三個帳號的模型帳本：`deepseek-v4.1-flash 免費 (樣本 2)`，EMA 與快照持久化生效
+- 公網端到端請求返回 200，`usage.credit=0` 被帳本學習
+- WAF 計數保持 0（`grep -c 'WAF Block Page' logs/*.log`）
+
+多代理池（`-proxies`）當前未在伺服器啟用：未配置時 `clientForAccount` 回退全局客戶端，
+行為與 Phase 3 一致。伺服器為單出口，配置代理池需另備出口 IP。
