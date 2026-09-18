@@ -352,7 +352,7 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 func fetchNPMCatalogVersion() (string, error) {
 	var lastErr error
 	for _, base := range npmBases {
-		resp, err := shortHTTPClient().Get(base + "/latest")
+		resp, err := cfg.HttpClient.Get(base + "/latest")
 		if err != nil {
 			lastErr = err
 			continue
@@ -444,7 +444,7 @@ func fetchNPMCatalog(version, file string) ([]catalogModel, string, error) {
 }
 
 func fetchNPMCatalogJSON(url string) ([]catalogModel, error) {
-	resp, err := shortHTTPClient().Get(url)
+	resp, err := cfg.HttpClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +491,7 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 }
 
 func fetchNPMCatalogTarball(url, file string) ([]catalogModel, error) {
-	resp, err := shortHTTPClient().Get(url)
+	resp, err := cfg.HttpClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -1041,7 +1041,9 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 		return "", 0, 0, err.Error()
 	}
 	backendHeaders(req, &auth, prof, "", newMessageID())
-	resp, err := clientForAccount(acc).Do(req)
+	// 聊天端点调用：走无总时长的聊天客户端。本函数自带的 60s ctx 才是
+	// 这里的超时来源（默认客户端的 180s 总时长会让 ctx 语义变得多余且易漂移）。
+	resp, err := chatClientForAccount(acc).Do(req)
 	if err != nil {
 		return "", 0, 0, "请求失败: " + err.Error()
 	}

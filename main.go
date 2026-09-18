@@ -293,11 +293,12 @@ const (
 	// 超时兜底：超过即放弃并返回错误，避免客户端无限等待。上限设为空闲超时 + 余量。
 	upstreamNonStreamTimeout = upstreamIdleTimeout + 60*time.Second
 
-	// upstreamShortTimeout 短请求的整体超时（npm 目录拉取等无 ctx 超时的调用）。
+	// upstreamDefaultTimeout 共享客户端的整体超时（默认安全）。
 	//
-	// 这些请求没有「流中续命」语义，必须靠总时长兜底：一个挂死的连接会永久占住
-	// 调用方的 goroutine。取值与旧版 Client.Timeout 一致（180s），覆盖大文件下载。
-	upstreamShortTimeout = 180 * time.Second
+	// 所有非聊天调用（凭据刷新、额度查询、签到、模型目录、价格探测）都走这个
+	// 客户端：它们没有「流中续命」语义，必须靠总时长兜底——一个挂死的连接会
+	// 永久占住调用方的 goroutine。取值与旧版 Client.Timeout 一致（180s）。
+	upstreamDefaultTimeout = 180 * time.Second
 
 	// accountFaultCooldown 账号级授权/配额故障的冷却时长。
 	//
@@ -373,8 +374,10 @@ var (
 
 	// proxyClients 多代理池的 HTTP 客户端表（代理 URL → 客户端，initHTTPClient 构建）。
 	proxyClients = map[string]*http.Client{}
-	// shortClient 短请求专用客户端（总时长兜底），见 initHTTPClient 的超时分层说明。
-	shortClient *http.Client
+	// proxyChatClients 同上，但为聊天上游专用（无总时长，见 initHTTPClient）。
+	proxyChatClients = map[string]*http.Client{}
+	// chatClient 聊天上游专用客户端（无总时长）。仅 upstreamChat 使用。
+	chatClient *http.Client
 
 	quotaScanTrigger = make(chan struct{}, 1)
 	checkinTrigger   = make(chan struct{}, 1)
@@ -601,58 +604,53 @@ func initHTTPClient() {
 	if err != nil {
 		log.Fatalf("错误: %v", err)
 	}
-	// 超时分三层，语义各自独立（对齐 wb2api 的分层设计）：
+	// 超时分层，语义各自独立（对齐 wb2api 的分层设计）：
 	//
-	//  1. Transport.ResponseHeaderTimeout（upstreamHeaderTimeout）：首字节前换号。
-	//     上游建连后迟迟不返回响应头时中断，让轮转换下一个账号——这是「首字节前」
-	//     的唯一约束。
-	//  2. Client.Timeout = 0：**刻意不设总时长**。流式响应可能持续数分钟（长思考、
-	//     长输出），总时长会把正常的长流硬切断，且切断点与上游行为无关。
-	//  3. IdleTimeout（upstreamIdleTimeout）：流中空闲掐流。活跃吐数据续命，
-	//     静默超过阈值才断——这才是流式场景真正需要的保护。
+	//  **默认安全**：共享客户端带总时长兜底。任何调用（凭据刷新、额度查询、
+	//  签到、模型目录、价格探测）都自带「挂死不会永久占用 goroutine」的保证，
+	//  无需每个调用点记得自建 ctx 超时。默认值不安全是陷阱——漏一处就是静默
+	//  的资源泄漏。
 	//
-	// 因此该客户端只用于**聊天上游调用**（流式/聚合）。其余短请求（npm 目录、
-	// 凭据刷新、额度查询、签到）不得共用：它们没有流中续命的需求，必须靠总时长
-	// 兜底，否则一个挂死的连接会永久占住调用方的 goroutine。这些调用走
-	// shortClient（见下）。
+	//  **聊天路径显式 opt-in**：流式响应可能持续数分钟（长思考、长输出），
+	//  总时长会把正常长流硬切断，且切断点与上游行为无关。因此聊天上游调用
+	//  专用客户端 Timeout=0，改由两层约束：
+	//    1. Transport.ResponseHeaderTimeout（120s）：首字节前换号。
+	//    2. 流中空闲监控（300s）：活跃吐数据续命，静默超阈值才断。
+	//  非流式聊天另有 ctx 总时长（upstreamNonStreamTimeout）。
 	cfg.HttpClient = &http.Client{
-		Timeout:   0,
+		Timeout:   upstreamDefaultTimeout,
 		Transport: transport,
 		Jar:       jar,
 	}
-	// shortClient 短请求专用客户端：与上游客户端共享 transport 与 cookie jar，
-	// 但设总时长兜底。供无自建 ctx 超时的调用使用（当前唯一用户是 npm 目录拉取）。
-	// 自建 ctx 超时的调用（doJSONContext 的调用方、probe、价格探测）可继续用
-	// cfg.HttpClient——它们的 ctx 已提供等价保护。
-	shortClient = &http.Client{
-		Timeout:   upstreamShortTimeout,
+	// chatClient 聊天上游专用客户端（无总时长）。仅 upstreamChat 使用，
+	// 见上方的分层说明；其余所有调用一律走 cfg.HttpClient。
+	chatClient = &http.Client{
+		Timeout:   0,
 		Transport: transport,
 		Jar:       jar,
 	}
 	// 多代理池（-proxies）：每个出口代理一个独立客户端（共享 cookie jar），
 	// 账号按凭据文件名稳定绑定到其中一个（见 clientForAccount）。绑定只作用于
 	// 账号维度的上游调用；未绑定的调用（npm 目录等）仍走全局客户端。
+	// 每个出口同样配「默认」与「聊天」两个客户端，语义与全局一致。
 	proxyClients = make(map[string]*http.Client, len(cfg.ProxyURLs))
+	proxyChatClients = make(map[string]*http.Client, len(cfg.ProxyURLs))
 	for _, proxyURL := range cfg.ProxyURLs {
 		poolTransport, err := newTransport(proxyURL)
 		if err != nil {
 			log.Fatalf("错误: %v", err)
 		}
 		proxyClients[proxyURL] = &http.Client{
+			Timeout:   upstreamDefaultTimeout,
+			Transport: poolTransport,
+			Jar:       jar,
+		}
+		proxyChatClients[proxyURL] = &http.Client{
 			Timeout:   0,
 			Transport: poolTransport,
 			Jar:       jar,
 		}
 	}
-}
-
-// shortHTTPClient 返回短请求专用客户端（总时长兜底）。initHTTPClient 未运行
-// （测试直接调目录拉取）时回落全局客户端，保持旧行为而不是 nil 解引用。
-func shortHTTPClient() *http.Client {
-	if shortClient != nil {
-		return shortClient
-	}
-	return cfg.HttpClient
 }
 
 // boundProxyURL 返回账号稳定绑定的出口代理 URL；未配置代理池时返回空串。
@@ -667,8 +665,8 @@ func boundProxyURL(acc *Account) string {
 	return cfg.ProxyURLs[int(h.Sum32())%len(cfg.ProxyURLs)]
 }
 
-// clientForAccount 返回账号绑定的 HTTP 客户端：配置多代理池时按文件名散列到
-// 池内一个出口；未配置（或客户端缺失）时回退全局客户端。
+// clientForAccount 返回账号绑定的 HTTP 客户端（默认安全，带总时长）。
+// 用于所有非聊天调用：凭据刷新、额度查询、签到、模型目录、价格探测。
 func clientForAccount(acc *Account) *http.Client {
 	if acc == nil || len(cfg.ProxyURLs) == 0 {
 		return cfg.HttpClient
@@ -677,6 +675,25 @@ func clientForAccount(acc *Account) *http.Client {
 		return client
 	}
 	return cfg.HttpClient
+}
+
+// chatClientForAccount 返回聊天上游调用专用客户端（无总时长）。
+//
+// 与 clientForAccount 的差异仅在 Client.Timeout：流式响应可能持续数分钟，
+// 总时长会把正常长流硬切断。改由 ResponseHeaderTimeout（首字节前）与流中
+// 空闲监控（静默掐流）两层约束，见 initHTTPClient 的分层说明。
+// **只允许 upstreamChat 使用**。
+func chatClientForAccount(acc *Account) *http.Client {
+	if acc == nil || len(cfg.ProxyURLs) == 0 {
+		if chatClient == nil {
+			return clientForAccount(acc) // 测试未初始化时回落
+		}
+		return chatClient
+	}
+	if client := proxyChatClients[boundProxyURL(acc)]; client != nil {
+		return client
+	}
+	return chatClientForAccount(nil)
 }
 
 // -----------------------------------------------------------------------------
@@ -3507,7 +3524,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			upstreamReq.Header.Set("X-Conversation-ID", conversationID)
 		}
 		backendHeaders(upstreamReq, acc.Auth, prof, convReqID, newMessageID())
-		resp, err := clientForAccount(acc).Do(upstreamReq)
+		resp, err := chatClientForAccount(acc).Do(upstreamReq)
 		acc.lock.Unlock()
 		if err != nil {
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)

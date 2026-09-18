@@ -202,7 +202,8 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 	}
 	backendHeaders(req, &auth, prof, "", newMessageID())
 
-	resp, err := clientForAccount(acc).Do(req)
+	// 聊天端点调用：走无总时长的聊天客户端（本函数自带的 60s ctx 为超时来源）。
+	resp, err := chatClientForAccount(acc).Do(req)
 	if err != nil {
 		result.Status = "error"
 		result.Detail = "上游请求失败: " + err.Error()

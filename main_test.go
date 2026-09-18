@@ -3319,6 +3319,78 @@ func TestParseNPMCatalogKeepsCapabilities(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// 超时分层与客户端路由测试
+// -----------------------------------------------------------------------------
+
+// 验证聊天路径走 chatClient（无总时长），而非共享的默认客户端。
+//
+// 这条断言防的是「mock 静默失效」：若聊天路径改用别的客户端，测试里注入的
+// mock 上游会被绕过——请求打向真实上游，测试却仍可能因其他原因「通过」。
+// 同时固定两个客户端的分工：默认客户端有总时长（挂死不会永久占用 goroutine），
+// 聊天客户端没有（长流不被硬切断，改由首字节超时 + 空闲监控约束）。
+func TestChatPathUsesChatClient(t *testing.T) {
+	chdirTemp(t)
+
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient, oldChat := cfg.HttpClient, chatClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	acc := &Account{Path: "route.json", Auth: &StoredAuth{
+		Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}}}
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	// 两个客户端都指向 mock（等价于 initHTTPClient 已运行后的替换）
+	cfg.HttpClient = server.Client()
+	chatClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient, chatClient = oldClient, oldChat
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if hits != 1 {
+		t.Fatalf("聊天请求应命中 mock 上游 1 次，实际 %d——说明未走 chatClientForAccount", hits)
+	}
+}
+
+// 验证两个客户端的超时分工：默认有总时长（默认安全），聊天无总时长（长流不切）。
+func TestClientTimeoutSplit(t *testing.T) {
+	if upstreamDefaultTimeout <= 0 {
+		t.Fatal("默认客户端必须有总时长：挂死的连接会永久占用调用方 goroutine")
+	}
+	if upstreamHeaderTimeout <= 0 || upstreamHeaderTimeout >= upstreamDefaultTimeout {
+		t.Fatalf("首字节超时应为正值且短于默认总时长，实际 %v vs %v", upstreamHeaderTimeout, upstreamDefaultTimeout)
+	}
+	if upstreamIdleTimeout <= 0 {
+		t.Fatal("流中空闲阈值应为正值")
+	}
+	// 空闲阈值必须显著大于正常思考间隙，否则会误杀健康长流
+	if upstreamIdleTimeout <= upstreamHeaderTimeout {
+		t.Fatalf("空闲阈值应大于首字节超时，实际 %v vs %v", upstreamIdleTimeout, upstreamHeaderTimeout)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // 会话头族测试
 // -----------------------------------------------------------------------------
 
