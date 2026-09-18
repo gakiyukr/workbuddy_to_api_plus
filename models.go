@@ -1004,7 +1004,7 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	if err != nil {
 		return "", 0, 0, err.Error()
 	}
-	backendHeaders(req, &auth, prof)
+	backendHeaders(req, &auth, prof, "", newMessageID())
 	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
 		return "", 0, 0, "请求失败: " + err.Error()

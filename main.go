@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -197,7 +199,9 @@ type Config struct {
 	LogFile         string // monitor 附加展示的日志文件路径
 	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
 	LogLines        int    // monitor 展示的最近日志行数
-	ModelsRefresh   int    // 官方模型目录刷新间隔（分钟），0 关闭
+	PromptMode      string // 系统提示词模式：passthrough（透传）/ custom（替换）/ append（插入）
+	PromptText      string // custom/append 模式使用的网关提示词文本，空 = 内置中性提示词
+	ModelsRefresh   int    // 官方模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）
 	ProbeModels     string // probe 专用：逗号分隔的模型列表
 	ProbeLimit      int    // probe 专用：未显式指定模型时的取用数量
 	HttpClient      *http.Client
@@ -310,10 +314,6 @@ var (
 	dailyCheckinMu   sync.Mutex
 )
 
-// -----------------------------------------------------------------------------
-// 主入口与命令行控制
-// -----------------------------------------------------------------------------
-
 func main() {
 	if len(os.Args) > 1 {
 		first := os.Args[1]
@@ -349,11 +349,12 @@ func main() {
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 15, "monitor 每次刷新展示的最近日志行数")
 	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）")
+	fs.StringVar(&cfg.PromptMode, "prompt-mode", "passthrough", "系统提示词模式：passthrough（透传客户端原值）/ custom（网关提示词替换）/ append（网关提示词插入）")
+	fs.StringVar(&cfg.PromptText, "prompt-text", "", "custom/append 模式的网关系统提示词文本，空 = 内置中性提示词")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
-	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
+	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未显式指定模型时探测的模型数量上限")
 	_ = fs.Parse(args)
 
-	// 检测 -auth 是否被显式指定：
 	// 若未指定 -auth 且未指定 -auth-dir，则自动扫描当前目录下所有 workbuddy*.json 组成账号池，
 	// 这样把多个凭据文件放进工作目录即可自动多账号，无需手写参数。
 	fs.Visit(func(f *flag.Flag) {
@@ -1185,19 +1186,19 @@ func hasBusinessEnvelope(body string) bool {
 type errKind int
 
 const (
-	errNone          errKind = iota // 成功 / 未分类
-	errWafBlock                     // 403 + 无业务信封：IP 级风控，账号健康 → 软冷却
-	errSessionDead                  // 401 / 12153 offline session：真授权失效 → 禁用
-	errAccountFault                 // 11140 request illegal / 14017 trial：账号级故障 → 冷却轮换
-	errHardCredit                   // 402 / 14018 余额耗尽 → 硬冷却至次日
-	errSoftRate                     // 429 / 限流文案 → 对齐上游重置时间
-	errModelBlocked                 // 6004 模型级限流 / 11102 无此模型 → 只冷却该模型
-	errNotFound                     // 404 上游偶发 → 短冷却
-	errServer                       // 5xx 上游故障 → 换号
-	errContentBlocked               // 400 + 审核文案：请求问题，不罚账号
-	errBadParams                    // 400 + 11101 解析失败：请求问题，不罚账号
-	errPromptTooLong                // 11115 上下文超限：请求问题，不罚账号且不轮转
-	errClient                       // 其他 4xx：换号（不同账号模型权限可能不同）
+	errNone           errKind = iota // 成功 / 未分类
+	errWafBlock                      // 403 + 无业务信封：IP 级风控，账号健康 → 软冷却
+	errSessionDead                   // 401 / 12153 offline session：真授权失效 → 禁用
+	errAccountFault                  // 11140 request illegal / 14017 trial：账号级故障 → 冷却轮换
+	errHardCredit                    // 402 / 14018 余额耗尽 → 硬冷却至次日
+	errSoftRate                      // 429 / 限流文案 → 对齐上游重置时间
+	errModelBlocked                  // 6004 模型级限流 / 11102 无此模型 → 只冷却该模型
+	errNotFound                      // 404 上游偶发 → 短冷却
+	errServer                        // 5xx 上游故障 → 换号
+	errContentBlocked                // 400 + 审核文案：请求问题，不罚账号
+	errBadParams                     // 400 + 11101 解析失败：请求问题，不罚账号
+	errPromptTooLong                 // 11115 上下文超限：请求问题，不罚账号且不轮转
+	errClient                        // 其他 4xx：换号（不同账号模型权限可能不同）
 )
 
 func (k errKind) String() string {
@@ -2927,7 +2928,11 @@ func authMiddleware(next http.Handler) http.Handler {
 // upstreamChat 完成「多账号轮询 + 429 冷却代偿 + 授权失效禁用 + 单账号串行」的上游调度。
 // 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
 // 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
-func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
+//
+// conversationID 为从请求体提取的会话键（可空）：非空时随头族透传 X-Conversation-ID，
+// 让上游按对话聚合。聚合主键 convReqID 在轮转循环外生成一次——同一次用户操作内的
+// 所有尝试（换号重试等）共享同键（issue #35 碎片化修复）。
+func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time, conversationID string) (*http.Response, *Account, *upstreamProfile, bool) {
 	traceID := w.Header().Get("X-Trace-ID")
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
@@ -2935,14 +2940,19 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	poolSize := len(accounts)
 	accountMu.Unlock()
 	if poolSize == 0 {
-		recordModelFailure(modelName, "no_auth")
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
 		return nil, nil, nil, false
 	}
+	// 会话头族聚合主键：轮转循环外生成一次，同一次用户操作内的所有尝试
+	//（换号重试等）共享同键，上游后台按它聚合成一条（issue #35）。
+	convReqID := newMessageID()
 
 	var lastRateErr string
 	var lastAuthErr string
 	var lastErr string
+	// 降级重试状态（请求级）：degradeApplied 保证单请求内只降级一次；
+	// currentBody 为当前生效的请求体（降级重试时会被重写）。
+	degradeApplied := false
+	currentBody := upstreamBytes
 	attempted := make(map[*Account]bool, poolSize)
 	for attempt := 0; attempt < poolSize; attempt++ {
 		acc, selection, err := nextAccountForModel(modelName, attempted)
@@ -2986,7 +2996,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
 		prof := acc.Profile()
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(currentBody))
 		if err != nil {
 			recordModelFailure(modelName, "req_create_error")
 			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
@@ -2995,7 +3005,12 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 注入 CodeBuddy 凭据与指纹 Header
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
-		backendHeaders(upstreamReq, acc.Auth, prof)
+		// 会话头族：聚合主键 convReqID 全轮转复用，messageID 每次尝试独立；
+		// conversationID 透传客户端原值（非空才发）。
+		if conversationID != "" {
+			upstreamReq.Header.Set("X-Conversation-ID", conversationID)
+		}
+		backendHeaders(upstreamReq, acc.Auth, prof, convReqID, newMessageID())
 		resp, err := cfg.HttpClient.Do(upstreamReq)
 		acc.lock.Unlock()
 		if err != nil {
@@ -3089,9 +3104,32 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				lastAuthErr = errStr
 				continue // 尝试下一个账号
 
-			case errContentBlocked, errBadParams:
-				// 请求级错误（内容审核 / body 畸形）：账号健康，不冷却不熔断，
-				// 但仍轮转——不同账号可能有不同的模型权限，值得再试一次。
+			case errContentBlocked:
+				// 内容拦截误报处理：passthrough/append 模式首遇时触发降级
+				//（到次日 00:00 CST），换中性提示词同请求内重试一次。
+				// append 降级重试退化为 replace——原文在场只会确定性再撞 400。
+				// custom 模式已是网关提示词，再拦说明非指纹误报，不进入降级。
+				// 第二次仍被拦（用户内容本身触发审核）→ 不轮转（换号结果相同），
+				// 透传错误。内容问题非账号问题：不罚账号。
+				if cfg.PromptMode != "custom" && !degradeApplied {
+					degrade.Trigger()
+					currentBody = rewriteSystemTo(currentBody, degradedPrompt)
+					degradeApplied = true
+					delete(attempted, acc) // 释放本账号，降级重试可再命中
+					log.Printf("[#%d] 账号 %s [%s] 内容拦截（疑似指纹误报），降级至 %s，中性提示词重试",
+						reqID, acc.Path, prof.Label, degrade.until.Format("2006-01-02 15:04"))
+					continue
+				}
+				log.Printf("[#%d] 账号 %s [%s] 内容拦截（%s），不罚账号不轮转，透传错误",
+					reqID, acc.Path, prof.Label, kind)
+				recordModelFailure(modelName, kind.String())
+				writeOpenAIError(w, http.StatusBadRequest, "content_blocked",
+					"content blocked by upstream content firewall")
+				return nil, nil, nil, false
+
+			case errBadParams:
+				// 请求体畸形（11101）：账号健康，不冷却，但仍轮转——
+				// 不同账号可能有不同的模型权限，值得再试一次。
 				log.Printf("[#%d] 账号 %s [%s] 请求级错误 (%s)，不罚账号但轮转重试",
 					reqID, acc.Path, prof.Label, kind)
 				lastErr = errStr
@@ -3159,6 +3197,27 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 深度思考 (Thinking) 自动适配：混元系列如果未关闭思考，自动赋予 high 档位保证深度思考输出
 	applyThinkingRules(reqObj, modelName)
 
+	// 系统提示词三模式（prompt-mode）：
+	//   passthrough（缺省）：透传客户端原始 system
+	//   custom：网关提示词替换所有 system/developer
+	//   append：在开头连续 system 块之后插入网关提示词（客户端规范与网关提示词并用）
+	// 降级期（degrade.Active）内 passthrough/append 退化为 replace 语义：
+	// 原文在场只会确定性再撞内容审核（见 upstreamChat 的降级重试）。
+	switch cfg.PromptMode {
+	case "custom":
+		promptReplaceSystem(reqObj, effectivePromptText())
+	case "append":
+		if degrade.Active() {
+			promptReplaceSystem(reqObj, degradedPrompt)
+		} else {
+			promptAppendSystem(reqObj, effectivePromptText())
+		}
+	default: // passthrough
+		if degrade.Active() {
+			promptReplaceSystem(reqObj, degradedPrompt)
+		}
+	}
+
 	// 模板净化：改写 Claude Code 等框架被腾讯官方逐字拉黑的固定 prompt 语句
 	sanitizeMessages(reqObj)
 
@@ -3178,7 +3237,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 	}
 
-	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
+	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime, resolveConversationID(reqObj))
 	if !ok {
 		return
 	}
@@ -3312,6 +3371,187 @@ func applyThinkingRules(obj map[string]any, modelName string) {
 	obj["reasoning_summary"] = "auto"
 }
 
+// -----------------------------------------------------------------------------
+// 会话头族：聚合主键与消息级 ID
+//
+// 背景：同一次用户操作内的多次上游尝试（换号重试 / 降级重发）此前各自生成
+// 独立的 X-Request-ID，上游后台把它们记成碎片化的多次调用。会话头族让这些
+// 尝试共享同一个 X-Conversation-Request-ID 聚合主键，后台按对话轮聚合。
+// -----------------------------------------------------------------------------
+
+// newMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
+// X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败时回落 uuid（同为
+// crypto 随机源）——恒 32 hex、恒合法，可直接用作 B3 TraceId。
+func newMessageID() string {
+	b := make([]byte, 16)
+	if _, err := cryptorand.Read(b); err == nil {
+		return hex.EncodeToString(b)
+	}
+	return strings.ReplaceAll(uuid.New().String(), "-", "")
+}
+
+// resolveConversationID 从已解析的请求体提取会话键（conversation 维度）。
+// 四个键按序尝试：metadata.conversation_id → metadata.conversationId →
+// conversation_id → conversationId。缺失返回 ""（不伪造：透传客户端原值优先，
+// 客户端没给就不发 X-Conversation-ID）。
+//
+// 注意不含 user 维度：user 的粒度远粗于上游对话级缓存的边界，
+// 一个 user 的全部并行对话会被钉到同一聚合键上。
+func resolveConversationID(obj map[string]any) string {
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v, _ := meta["conversation_id"].(string); v != "" {
+			return v
+		}
+		if v, _ := meta["conversationId"].(string); v != "" {
+			return v
+		}
+	}
+	if v, _ := obj["conversation_id"].(string); v != "" {
+		return v
+	}
+	v, _ := obj["conversationId"].(string)
+	return v
+}
+
+// validB3TraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
+// 官方客户端生成的 conversationRequestId 是 32 位 hex（UUID 去横线），
+// 入站透传值可能是任意形状（含横线/超长/非 hex），直接塞进 B3 头会破坏链路关联。
+func validB3TraceID(s string) bool {
+	if len(s) != 16 && len(s) != 32 {
+		return false
+	}
+	for i := range s {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// -----------------------------------------------------------------------------
+// 内容拦截降级重试（prompt.mode 三模式 + degradeGate）
+//
+// 误报处理哲学（与指纹脱敏同源）：内容拦截多为 system 来源的指纹误报，
+// 换最小中性提示词即可绕开。custom 模式已用网关提示词替换，再撞审核说明
+// 不是指纹误报（大概率是用户内容本身），不进入降级路径。
+// -----------------------------------------------------------------------------
+
+// degradedPrompt 降级提示词：误报处理用，刻意极简中性。
+const degradedPrompt = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
+
+// degradeGate 降级状态机：passthrough/append 模式下请求被内容策略拦截时，
+// 切换到 degradedPrompt 直到次日 00:00 CST 重置。进程内存、重启清零。
+type degradeGate struct {
+	mu    sync.Mutex
+	until time.Time
+}
+
+// degrade 全局降级门（进程级：任一请求触发，其后所有请求直达降级态）。
+var degrade degradeGate
+
+// Active 当前是否处于降级期。
+func (g *degradeGate) Active() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return time.Now().Before(g.until)
+}
+
+// Trigger 触发降级，直到次日 00:00 CST。已在降级期内则不续期
+// （保持最早触发点的 00:00 重置语义）。
+func (g *degradeGate) Trigger() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !time.Now().Before(g.until) {
+		g.until = nextMidnightCST(time.Now())
+	}
+}
+
+// nextMidnightCST 返回 now 之后最近的 Asia/Shanghai 00:00 时刻。
+// 用固定 +08:00 偏移计算，避免依赖系统时区配置（容器/宿主机时区不确定）。
+// 边界：23:59 → 次日 00:00；00:00 → 次日 00:00（刚过零点，下个零点是次日）。
+func nextMidnightCST(now time.Time) time.Time {
+	cst := time.FixedZone("CST", 8*60*60)
+	y, m, d := now.In(cst).Date()
+	midnight := time.Date(y, m, d, 0, 0, 0, 0, cst)
+	for !midnight.After(now) {
+		midnight = midnight.Add(24 * time.Hour)
+	}
+	return midnight
+}
+
+// effectivePromptText 返回 custom/append 模式实际使用的提示词文本。
+func effectivePromptText() string {
+	if cfg.PromptText != "" {
+		return cfg.PromptText
+	}
+	return degradedPrompt
+}
+
+// promptReplaceSystem 用网关提示词替换 messages 中所有 system/developer 块
+// （custom 模式与降级重试用）。保底：无 messages 字段时注入单条 system。
+func promptReplaceSystem(obj map[string]any, systemPrompt string) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		obj["messages"] = []any{map[string]any{"role": "system", "content": systemPrompt}}
+		return
+	}
+	kept := make([]any, 0, len(msgs)+1)
+	kept = append(kept, map[string]any{"role": "system", "content": systemPrompt})
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			kept = append(kept, m)
+			continue
+		}
+		if roleOfMessage(mm) == "system" || roleOfMessage(mm) == "developer" {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	obj["messages"] = kept
+}
+
+// rewriteSystemTo 对序列化后的请求体执行 system 替换（降级重试用）。
+func rewriteSystemTo(body []byte, systemPrompt string) []byte {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	promptReplaceSystem(obj, systemPrompt)
+	if out, err := json.Marshal(obj); err == nil {
+		return out
+	}
+	return body
+}
+
+// promptAppendSystem 在 messages 的「开头连续 system/developer 块」之后插入
+// 一条网关提示词（append 模式）。既有消息逐字不动——客户端项目规范与网关
+// 提示词并用。
+func promptAppendSystem(obj map[string]any, systemPrompt string) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		obj["messages"] = []any{map[string]any{"role": "system", "content": systemPrompt}}
+		return
+	}
+	// 开头连续块 = 从 messages[0] 起向后 role 为 system/developer 的消息；
+	// 遇第一条非 system/developer 消息即停。
+	blockEnd := 0
+	for blockEnd < len(msgs) {
+		role := roleOfMessage(msgs[blockEnd])
+		if role != "system" && role != "developer" {
+			break
+		}
+		blockEnd++
+	}
+	gwMsg := map[string]any{"role": "system", "content": systemPrompt}
+	out := make([]any, 0, len(msgs)+1)
+	out = append(out, msgs[:blockEnd]...)
+	out = append(out, gwMsg)
+	out = append(out, msgs[blockEnd:]...)
+	obj["messages"] = out
+}
+
 // sanitizeMessages 净化 messages 的 content / reasoning_content / tool_calls。
 //
 // content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
@@ -3424,10 +3664,10 @@ func roleOfMessage(m any) string {
 // sanitizeFeatures 特征预检词表：任一命中才进入净化。
 // 普通请求全不中 → 原样返回，零分配。
 var sanitizeFeatures = []string{
-	"x-anthropic-billing-header",                      // header 键值段键名
-	"cc_entrypoint=",                                  // 尾随裸键值（截断前缀即可命中）
-	"You are Claude Code",                             // 身份句（截断前缀即可命中）
-	"Main branch (",                                   // 注入指令句（截断前缀即可命中）
+	"x-anthropic-billing-header", // header 键值段键名
+	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
+	"You are Claude Code",        // 身份句（截断前缀即可命中）
+	"Main branch (",              // 注入指令句（截断前缀即可命中）
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
@@ -3442,7 +3682,7 @@ var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?
 // 语义不变、保留可读性。大小写不敏感，覆盖 X-Anthropic-... 变体。
 //
 // 该正则不要求冒号，是 sanitizeHdrRe 的超集——两者替换语义不同
-//（整段删除 vs 最小缩写），不可合并为一个正则。
+// （整段删除 vs 最小缩写），不可合并为一个正则。
 var sanitizeBareHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
 
 // sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
@@ -3552,7 +3792,7 @@ func sanitizeContent(v any) (any, bool) {
 // arguments 是**字符串化的 JSON**（不是对象），因此按文本走 sanitizeText 即可。
 // 这块长期是盲区：工具调用消息的 content 通常是 null，若在 content 缺失时直接跳过，
 // 整条消息连 tool_calls 一起漏过——于是历史里任何写进工具参数的被拦字符串
-//（文件名、命令、写入内容）都会原样漏出。
+// （文件名、命令、写入内容）都会原样漏出。
 func sanitizeToolCalls(v any) bool {
 	callList, ok := v.([]any)
 	if !ok {
@@ -3580,14 +3820,31 @@ func sanitizeToolCalls(v any) bool {
 	return changed
 }
 
-// backendHeaders 设置 CodeBuddy 上游专用指纹与鉴权 Header（按站点 Profile 生成）
-func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
+// backendHeaders 设置 CodeBuddy 上游专用指纹与鉴权 Header（按站点 Profile 生成）。
+//
+// convReqID 为会话头族的**聚合主键**（X-Conversation-Request-ID / X-Root-Request-ID）：
+// 同一次用户操作内的所有上游尝试复用同值，后台据此按对话轮聚合（issue #35）。
+// messageID 为消息级 ID（X-Request-ID / X-Conversation-Message-ID），每次尝试独立。
+func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, convReqID, messageID string) {
 	commonHeaders(req, prof)
-	reqID := uuid.New().String()
-	req.Header.Set("X-Request-ID", reqID)
-	req.Header.Set("X-Trace-ID", reqID)
+	req.Header.Set("X-Request-ID", messageID)
+	req.Header.Set("X-Trace-ID", messageID)
 	req.Header.Set("X-Client-ID", prof.ClientID)
 	req.Header.Set("X-Client-Version", prof.ClientVer)
+
+	// 会话头族：与官方客户端同构（conversationID 透传优先，客户端没给就不发）。
+	if convReqID != "" {
+		req.Header.Set("X-Conversation-Request-ID", convReqID)
+		req.Header.Set("X-Root-Request-ID", convReqID)
+	}
+	req.Header.Set("X-Conversation-Message-ID", messageID)
+	b3Trace := convReqID
+	if !validB3TraceID(b3Trace) {
+		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
+	}
+	req.Header.Set("X-B3-TraceId", b3Trace)
+	req.Header.Set("X-B3-SpanId", messageID[:16])
+	req.Header.Set("X-B3-Sampled", "1")
 
 	if sa != nil && sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)

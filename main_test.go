@@ -1833,3 +1833,275 @@ func TestSanitizeMessagesMultimodalContent(t *testing.T) {
 		t.Errorf("image part 被改动: %q", img)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// 会话头族测试
+// -----------------------------------------------------------------------------
+
+// 验证消息级 ID 形态：32 hex（对齐官方 X-Request-ID / X-Conversation-Message-ID）
+func TestNewMessageID(t *testing.T) {
+	seen := make(map[string]bool)
+	for range 100 {
+		id := newMessageID()
+		if len(id) != 32 {
+			t.Fatalf("newMessageID() = %q, 长度应为 32", id)
+		}
+		if !validB3TraceID(id) {
+			t.Fatalf("newMessageID() = %q, 应为合法 hex", id)
+		}
+		if seen[id] {
+			t.Fatalf("newMessageID() 重复生成 %q", id)
+		}
+		seen[id] = true
+	}
+}
+
+// 验证会话键提取：四键按序尝试，缺失返回空串
+func TestResolveConversationID(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  map[string]any
+		want string
+	}{
+		{"metadata.snake_case", map[string]any{"metadata": map[string]any{"conversation_id": "c1"}}, "c1"},
+		{"metadata.camelCase", map[string]any{"metadata": map[string]any{"conversationId": "c2"}}, "c2"},
+		{"顶层snake_case", map[string]any{"conversation_id": "c3"}, "c3"},
+		{"顶层camelCase", map[string]any{"conversationId": "c4"}, "c4"},
+		{"snake优先于camel", map[string]any{
+			"metadata":       map[string]any{"conversation_id": "a", "conversationId": "b"},
+			"conversationId": "c",
+		}, "a"},
+		{"缺失", map[string]any{"model": "x"}, ""},
+		{"空对象", map[string]any{}, ""},
+		{"非字符串类型", map[string]any{"conversationId": 12345}, ""},
+	}
+	for _, c := range cases {
+		if got := resolveConversationID(c.obj); got != c.want {
+			t.Errorf("%s: resolveConversationID = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// 验证 B3 TraceId 合法性判定：16/32 hex 合法，其余（含横线 UUID）非法
+func TestValidB3TraceID(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"0123456789abcdef0123456789abcdef", true}, // 32 hex
+		{"0123456789abcdef", true},                 // 16 hex
+		{"0123456789ABCDEF0123456789ABCDEF", true}, // 大写
+		{"550e8400-e29b-41d4-a716-446655440000", false}, // 带横线 UUID
+		{"", false},
+		{"short", false},
+		{"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", false}, // 非 hex
+	}
+	for _, c := range cases {
+		if got := validB3TraceID(c.in); got != c.want {
+			t.Errorf("validB3TraceID(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// 验证 backendHeaders 注入完整的会话头族，且聚合主键与消息级 ID 各司其职。
+func TestBackendHeadersConversationFamily(t *testing.T) {
+	convReqID := newMessageID()
+	req, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+	backendHeaders(req, &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "tok"}}, &profileCN, convReqID, newMessageID())
+
+	// 聚合主键：两处头同值
+	if got := req.Header.Get("X-Conversation-Request-ID"); got != convReqID {
+		t.Errorf("X-Conversation-Request-ID = %q, want %q", got, convReqID)
+	}
+	if got := req.Header.Get("X-Root-Request-ID"); got != convReqID {
+		t.Errorf("X-Root-Request-ID = %q, want %q", got, convReqID)
+	}
+	// B3 TraceId 用聚合主键（32 hex 合法）
+	if got := req.Header.Get("X-B3-TraceId"); got != convReqID {
+		t.Errorf("X-B3-TraceId = %q, want %q", got, convReqID)
+	}
+	// 消息级 ID 独立
+	if got := req.Header.Get("X-Conversation-Message-ID"); got == convReqID {
+		t.Errorf("X-Conversation-Message-ID 不应与聚合主键相同")
+	}
+	if got := req.Header.Get("X-B3-SpanId"); got != req.Header.Get("X-Conversation-Message-ID")[:16] {
+		t.Errorf("X-B3-SpanId = %q, want messageID 前 16 位", got)
+	}
+	if got := req.Header.Get("X-B3-Sampled"); got != "1" {
+		t.Errorf("X-B3-Sampled = %q, want 1", got)
+	}
+	// 消息级 ID 形态合法
+	if !validB3TraceID(req.Header.Get("X-Request-ID")) {
+		t.Errorf("X-Request-ID 非合法 hex: %q", req.Header.Get("X-Request-ID"))
+	}
+}
+
+// 验证非法 B3 TraceId 时回落到消息级 ID（不破坏链路关联）。
+func TestBackendHeadersB3Fallback(t *testing.T) {
+	badID := "550e8400-e29b-41d4-a716-446655440000" // 带横线，非法
+	req, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+	backendHeaders(req, &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "tok"}}, &profileCN, badID, newMessageID())
+
+	if got := req.Header.Get("X-Conversation-Request-ID"); got != badID {
+		// 主键照发（上游 B3 之外的头不做 hex 校验）
+		t.Errorf("X-Conversation-Request-ID = %q, want %q", got, badID)
+	}
+	if got := req.Header.Get("X-B3-TraceId"); got == badID {
+		t.Errorf("X-B3-TraceId 不应透传非法值")
+	}
+	if !validB3TraceID(req.Header.Get("X-B3-TraceId")) {
+		t.Errorf("X-B3-TraceId 回落值非法: %q", req.Header.Get("X-B3-TraceId"))
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 降级重试测试
+// -----------------------------------------------------------------------------
+
+// 验证 nextMidnightCST 的边界语义：恒返回未来时刻，且为 CST 零点。
+func TestNextMidnightCST(t *testing.T) {
+	cases := []struct {
+		name string
+		now  time.Time
+	}{
+		{"白天", time.Date(2026, 9, 17, 14, 0, 0, 0, time.UTC)},
+		{"23:59 CST", time.Date(2026, 9, 17, 15, 59, 0, 0, time.UTC)},  // CST 23:59
+		{"00:00 CST", time.Date(2026, 9, 17, 16, 0, 0, 0, time.UTC)},   // CST 00:00
+		{"00:01 CST", time.Date(2026, 9, 17, 16, 1, 0, 0, time.UTC)},   // CST 00:01
+	}
+	cst := time.FixedZone("CST", 8*60*60)
+	for _, c := range cases {
+		got := nextMidnightCST(c.now)
+		if !got.After(c.now) {
+			t.Errorf("%s: %v 未晚于 now %v", c.name, got, c.now)
+		}
+		// 必须落在 CST 零点
+		y, m, d := got.In(cst).Date()
+		if got.In(cst).Hour() != 0 || got.In(cst).Minute() != 0 || got.In(cst).Second() != 0 {
+			t.Errorf("%s: %v 非 CST 零点", c.name, got)
+		}
+		t.Logf("%s: now=%v -> %v (CST %d-%02d-%02d 00:00)", c.name, c.now.In(cst), got.In(cst), y, m, d)
+	}
+	// 24h 内必有下一次零点
+	if nextMidnightCST(time.Now()).Sub(time.Now()) > 24*time.Hour {
+		t.Error("next midnight 超过 24h")
+	}
+}
+
+// 验证降级门状态机：触发后 Active，次日重置；未触发不续期。
+func TestDegradeGate(t *testing.T) {
+	var g degradeGate
+	if g.Active() {
+		t.Fatal("初始状态不应为降级期")
+	}
+	g.Trigger()
+	if !g.Active() {
+		t.Fatal("触发后应为降级期")
+	}
+	first := g.until
+	time.Sleep(5 * time.Millisecond)
+	g.Trigger() // 已在降级期内 → 不续期
+	if !g.until.Equal(first) {
+		t.Errorf("降级期内重复触发不应续期: first=%v second=%v", first, g.until)
+	}
+}
+
+// 验证 promptReplaceSystem 替换所有 system/developer 并保留其余消息原序。
+func TestPromptReplaceSystem(t *testing.T) {
+	obj := map[string]any{"messages": []any{
+		msg("system", "old system"),
+		msg("developer", "old dev"),
+		msg("user", "hi"),
+		msg("assistant", "hello"),
+		msg("user", "again"),
+	}}
+	promptReplaceSystem(obj, "gw prompt")
+
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("len = %d, want 4 (1 gw + user/assistant/user)", len(msgs))
+	}
+	if roleOfMessage(msgs[0]) != "system" {
+		t.Fatalf("首条应为 system")
+	}
+	if c, _ := msgs[0].(map[string]any)["content"].(string); c != "gw prompt" {
+		t.Errorf("首条 content = %q, want gw prompt", c)
+	}
+	// user/assistant 原序保留
+	for i, want := range []string{"user", "assistant", "user"} {
+		if got := roleOfMessage(msgs[i+1]); got != want {
+			t.Errorf("msgs[%d].role = %q, want %q", i+1, got, want)
+		}
+	}
+}
+
+// 验证 promptAppendSystem 在开头连续 system 块之后插入，既有消息逐字不动。
+func TestPromptAppendSystem(t *testing.T) {
+	obj := map[string]any{"messages": []any{
+		msg("system", "s1"),
+		msg("developer", "s2"),
+		msg("user", "hi"),
+		msg("system", "mid-system"), // 中途 system 不属于「开头连续块」
+		msg("user", "again"),
+	}}
+	promptAppendSystem(obj, "gw prompt")
+
+	msgs := obj["messages"].([]any)
+	// 期望：s1(system), s2(developer 保持原样——归一化由管线下游的
+	// sanitizeMessages 负责，append 只做插入), gw, user, mid-system, user
+	want := []struct{ role, content string }{
+		{"system", "s1"}, {"developer", "s2"}, {"system", "gw prompt"},
+		{"user", "hi"}, {"system", "mid-system"}, {"user", "again"},
+	}
+	if len(msgs) != len(want) {
+		t.Fatalf("len = %d, want %d", len(msgs), len(want))
+	}
+	for i, w := range want {
+		m := msgs[i].(map[string]any)
+		if gotRole := roleOfMessage(m); gotRole != w.role {
+			t.Errorf("msgs[%d].role = %q, want %q", i, gotRole, w.role)
+		}
+		if gotC, _ := m["content"].(string); gotC != w.content {
+			t.Errorf("msgs[%d].content = %q, want %q", i, gotC, w.content)
+		}
+	}
+}
+
+// 验证 effectivePromptText 的回落逻辑。
+func TestEffectivePromptText(t *testing.T) {
+	oldMode, oldText := cfg.PromptMode, cfg.PromptText
+	defer func() { cfg.PromptMode, cfg.PromptText = oldMode, oldText }()
+
+	cfg.PromptText = ""
+	if got := effectivePromptText(); got != degradedPrompt {
+		t.Errorf("空 PromptText 应回落 degradedPrompt, got %q", got)
+	}
+	cfg.PromptText = "custom text"
+	if got := effectivePromptText(); got != "custom text" {
+		t.Errorf("got %q, want custom text", got)
+	}
+}
+
+// 验证 rewriteSystemTo 对序列化 body 的替换，以及坏 JSON 的原样返回。
+func TestRewriteSystemTo(t *testing.T) {
+	body := `{"model":"m","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`
+	got := rewriteSystemTo([]byte(body), "new system")
+	var obj map[string]any
+	if err := json.Unmarshal(got, &obj); err != nil {
+		t.Fatalf("输出非合法 JSON: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("len = %d, want 2", len(msgs))
+	}
+	first := msgs[0].(map[string]any)
+	if c, _ := first["content"].(string); c != "new system" {
+		t.Errorf("首条 = %q, want new system", c)
+	}
+
+	// 坏 JSON 原样返回
+	bad := []byte("{broken")
+	if got := rewriteSystemTo(bad, "x"); string(got) != string(bad) {
+		t.Errorf("坏 JSON 应原样返回, got %q", got)
+	}
+}

@@ -200,7 +200,7 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 		result.Detail = err.Error()
 		return result
 	}
-	backendHeaders(req, &auth, prof)
+	backendHeaders(req, &auth, prof, "", newMessageID())
 
 	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
