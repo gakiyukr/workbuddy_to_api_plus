@@ -1582,14 +1582,19 @@ func isContentBlocked(statusCode int, body string) bool {
 	)
 }
 
-// isBadParams 请求体解析失败（HTTP 400 + code 11101）。
-// 发给上游的 body 有问题，换账号照样 400。
+// isBadParams 请求级参数错误（HTTP 400 + code 11101 / 11129）。
+// 发给上游的 body 有问题，换账号照样 400：
+//   - 11101 / "Unmarshal chat params failed"：请求体解析失败；
+//   - 11129 / "invalid function call parameters"：工具定义不符合模型要求
+//     （如 parameters 缺 type 声明）。二者都是确定性的请求侧缺陷。
 func isBadParams(statusCode int, body string) bool {
 	if statusCode < 400 {
 		return false
 	}
 	return containsAnyFold(body, "Unmarshal chat params failed") ||
-		strings.Contains(body, `"code":11101`)
+		strings.Contains(body, `"code":11101`) ||
+		strings.Contains(body, `"code":11129`) ||
+		containsAnyFold(body, "invalid function call parameters")
 }
 
 // isPromptTooLong 上下文超限（code 11115 / "prompt is too long"）。
@@ -3427,6 +3432,11 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	var lastRateErr string
 	var lastAuthErr string
 	var lastErr string
+	// 最后一次上游非 200 响应的状态码与分类：轮转耗尽的兜底用它把真实原因
+	// 透传给客户端（而不是笼统的「所有账号均处于冷却状态」——那会让客户端
+	// 在「模型名错了」「工具定义无效」这类可自纠的问题上陷入无意义重试）。
+	lastErrStatus := 0
+	var lastKind errKind
 	// 降级重试状态（请求级）：degradeApplied 保证单请求内只降级一次；
 	// currentBody 为当前生效的请求体（降级重试时会被重写）。
 	degradeApplied := false
@@ -3543,6 +3553,10 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 
 			kind := classifyUpstream(resp.StatusCode, errStr)
+
+			// 记录最后一次上游失败（原文/状态码/分类，见 lastErrStatus 声明处的
+			// 说明）。统一在分类后记录，不依赖各分支自行赋值。
+			lastErr, lastErrStatus, lastKind = errStr, resp.StatusCode, kind
 
 			// 请求级错误（上下文超限）：换任何账号都会得到同样结果，
 			// 轮转纯属浪费健康号配额，直接透传上游原文。
@@ -3678,7 +3692,31 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		return resp, acc, prof, true
 	}
 
-	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
+	// 轮转耗尽（poolSize 次尝试均未成功）。区分两种情形：
+	//
+	//  - 全程没有任何上游非 200 响应（账号全部 token 失效 / 被禁用，循环内
+	//    continue 掉）：确实没有可透传的上游信息，保持原语义 429
+	//    all_accounts_cooldown。
+	//  - 每次尝试都收到上游 4xx/5xx：透传**最后一次**的真实状态码与原文，并附
+	//    gateway_hint。笼统的 429 会掩盖根因——例如全部账号都返回 11102（模型
+	//    在该站点不存在）时，客户端需要的是「模型名错了」而不是「账号都在冷却」：
+	//    前者改一次模型名即可自纠，后者只会引发无意义的重试循环。生产实测
+	//    （2026-09-18）中 11129「工具定义无效」×4 账号轮转后报 429，排查成本
+	//    远高于读一条正确的错误。
+	//
+	//  WAF 拦截是唯一特例：拦截页是 HTML，透传给 OpenAI 客户端无意义，改发
+	//  503 + 专用错误类型，语义是「服务暂时被风控，稍后重试」。
+	if lastErrStatus > 0 {
+		recordModelFailure(modelName, lastKind.String())
+		if lastKind == errWafBlock {
+			writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_waf_blocked",
+				"all accounts were blocked by upstream WAF; retry after the block window", lastKind)
+			return nil, nil, nil, false
+		}
+		writeOpenAIErrorHint(w, lastErrStatus, "upstream_error",
+			fmt.Sprintf("upstream %d: %s", lastErrStatus, lastErr), lastKind)
+		return nil, nil, nil, false
+	}
 	recordModelFailure(modelName, "all_cooldown")
 	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
@@ -5534,8 +5572,10 @@ func gatewayHint(kind errKind) string {
 	case errContentBlocked:
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径。
 		return "request content was rejected by content policy; adjust the prompt and retry"
+	case errBadParams:
+		return "upstream rejected the request parameters; check the request body and tool definitions"
 	default:
-		// errNone / errNotFound / errServer / errBadParams / errClient 等未覆盖形态：无 hint。
+		// errNone / errNotFound / errServer / errClient 等未覆盖形态：无 hint。
 		return ""
 	}
 }

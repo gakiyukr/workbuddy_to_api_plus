@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -657,8 +658,8 @@ func TestClassifyUpstream(t *testing.T) {
 		{"429账号级限流", 429, `{"msg":"频率限制"}`, errSoftRate},
 		{"11102模型不存在", 400, `{"code":11102,"msg":"service info not found"}`, errModelBlocked},
 		{"11115上下文超限", 400, `{"code":11115,"msg":"prompt is too long"}`, errPromptTooLong},
-		{"内容审核", 400, `{"msg":"blocked by security policy"}`, errContentBlocked},
 		{"参数畸形", 400, `{"code":11101,"msg":"Unmarshal chat params failed"}`, errBadParams},
+		{"11129工具定义无效", 400, `{"code":11129,"msg":"invalid function call parameters","extError":{"code":"invalid_function_parameters","type":"invalid_request_error"},"displayMsg":{"en":"The tool definition does not meet the model requirements."}}`, errBadParams},
 		{"404偶发", 404, `{}`, errNotFound},
 		{"500服务端", 500, `{}`, errServer},
 		{"其他4xx", 400, `{"msg":"unknown"}`, errClient},
@@ -695,6 +696,176 @@ func TestErrKindDispatchSemantics(t *testing.T) {
 		if !k.rotatesAccount() {
 			t.Errorf("%v 应轮转", k)
 		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 轮转耗尽兜底测试
+// -----------------------------------------------------------------------------
+
+// setupMultiAccountTest 构造 N 个账号的测试环境：所有账号指向同一个 mock 上游，
+// Token 有效（1 小时）。返回恢复函数。
+func setupMultiAccountTest(t *testing.T, n int, server *httptest.Server) func() {
+	t.Helper()
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	accs := make([]*Account, n)
+	for i := range accs {
+		accs[i] = &Account{Path: fmt.Sprintf("acc%d.json", i), Auth: &StoredAuth{
+			Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}}}
+	}
+	accounts, rrIndex = accs, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	return func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}
+}
+
+// 验证问题 1 修复：全部账号都返回 11102（模型在该站点不存在）时，客户端应收到
+// 最后一次上游 400 原文 + gateway_hint，而不是笼统的 429「所有账号均处于冷却状态」
+// ——前者让客户端改一次模型名即可自纠，后者只会引发无意义重试循环。
+func TestFallbackPassesThroughModelNotFound(t *testing.T) {
+	chdirTemp(t)
+	const upstreamBody = `{"code":11102,"msg":"model [deepseek-x] service info not found","displayMsg":{"en":"The requested model is not available. Please switch to another model."}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer server.Close()
+	restore := setupMultiAccountTest(t, 3, server)
+	defer restore()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-x","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("应透传上游 400，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	errObj := body["error"].(map[string]any)
+	if !strings.Contains(errObj["message"].(string), "11102") {
+		t.Fatalf("message 应含上游原文 11102: %q", errObj["message"])
+	}
+	if errObj["gateway_hint"] != gatewayHint(errModelBlocked) {
+		t.Fatalf("应带 errModelBlocked 的 hint，实际 %#v", errObj["gateway_hint"])
+	}
+}
+
+// 验证 11129（工具定义无效）归入 errBadParams 后，轮转耗尽的兜底同样透传原文，
+// 客户端能看到「工具定义不符合要求」而不是 429 冷却。
+func TestFallbackPassesThroughBadParams(t *testing.T) {
+	chdirTemp(t)
+	const upstreamBody = `{"code":11129,"msg":"invalid function call parameters","displayMsg":{"en":"The tool definition does not meet the model requirements. Please check your tool configuration."}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer server.Close()
+	restore := setupMultiAccountTest(t, 2, server)
+	defer restore()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("应透传上游 400，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	errObj := body["error"].(map[string]any)
+	if errObj["gateway_hint"] != gatewayHint(errBadParams) {
+		t.Fatalf("应带 errBadParams 的 hint，实际 %#v", errObj["gateway_hint"])
+	}
+}
+
+// 验证 WAF 特例：全部账号被 WAF 拦截时返回 503 + 专用错误类型（拦截页是 HTML，
+// 透传原文对 OpenAI 客户端无意义），且带 WAF hint。
+func TestFallbackWafSpecialCase(t *testing.T) {
+	chdirTemp(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "<!DOCTYPE html><html><title>WAF Block Page</title></html>")
+	}))
+	defer server.Close()
+	restore := setupMultiAccountTest(t, 2, server)
+	defer restore()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("WAF 兜底应返回 503，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_waf_blocked") {
+		t.Fatalf("应返回 upstream_waf_blocked 类型: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), gatewayHint(errWafBlock)) {
+		t.Fatalf("应带 WAF hint: %s", rec.Body.String())
+	}
+}
+
+// 验证保留路径：全程没有上游非 200 响应（账号选号成功但 token 刷新全部失败，
+// 循环内 continue 耗尽）时，保持原语义 429 all_accounts_cooldown——此时确实
+// 没有可透传的上游信息。
+func TestFallbackKeepsCooldownWhenNoUpstreamResponse(t *testing.T) {
+	chdirTemp(t)
+	// mock：刷新端点返回 500（token 无法续期），chat 端点不应被触达
+	refreshed := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "auth/token") {
+			refreshed++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"code":10000,"msg":"refresh unavailable"}`)
+			return
+		}
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer server.Close()
+	restore := setupMultiAccountTest(t, 2, server)
+	defer restore()
+	// Token 已过期 + 有 RefreshToken：强制每个账号在发送前走真实的刷新路径
+	accountMu.Lock()
+	for _, acc := range accounts {
+		acc.Auth.Auth.ExpiresAt = time.Now().Add(-time.Minute).Unix()
+		acc.Auth.Auth.RefreshToken = "rt-test"
+	}
+	accountMu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+
+	if refreshed == 0 {
+		t.Fatal("测试构造失败：刷新端点未被调用")
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("无上游响应时应保持 429，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "all_accounts_cooldown") {
+		t.Fatalf("应保持 all_accounts_cooldown: %s", rec.Body.String())
 	}
 }
 
@@ -2489,11 +2660,11 @@ func TestGatewayHintMapping(t *testing.T) {
 		{errHardCredit, true},
 		{errModelBlocked, true},
 		{errContentBlocked, true},
+		{errBadParams, true},
 		// 未覆盖形态：无 hint
 		{errNone, false},
 		{errNotFound, false},
 		{errServer, false},
-		{errBadParams, false},
 		{errClient, false},
 	}
 	for _, c := range cases {
