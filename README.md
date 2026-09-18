@@ -626,7 +626,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ## 从源码构建
 
-需要 Go 1.20+：
+需要 Go 1.26+（`go.mod` 要求 1.26.5）：
 
 ```bash
 git clone https://github.com/CangShui/workbuddy-gateway.git
