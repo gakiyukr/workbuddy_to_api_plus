@@ -1387,6 +1387,9 @@ func clearDisabledMarker(path string) {
 
 // hasBusinessEnvelope 报告响应体是否带上游业务信封（含 `"code":` 或 `"msg":`）。
 //
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/upstream/client.go
+// （MIT License, Copyright (c) 2026 Sliverkiss），逐字保留。
+//
 // 不做 JSON 解析：信封存在性只需字段名命中。畸形 JSON 但含 `"msg":` 字样仍按
 // 业务响应保守处理——宁漏判 WAF 也不误罚业务 403（后者有各自的权威分类）。
 func hasBusinessEnvelope(body string) bool {
@@ -1614,7 +1617,10 @@ func classifyUpstream(statusCode int, body string) errKind {
 // 判定口径（移植自 wb2api 的 IsWafBlocked）：HTTP 403 且 body 无业务信封。
 // APISIX WAF 拦截页返回 HTML（`<!DOCTYPE html>...<title>WAF Block Page</title>`）、
 // 空体或纯文本，三者均命中；带业务信封的 403（如 11140 request illegal、
-// 11128 内容拦截）仍走 isAuthFailure 的既有文案判定，不受影响。
+// 11-128 内容拦截）仍走 isAuthFailure 的既有文案判定，不受影响。
+//
+// 来源：Sliverkiss/workbuddy2api 的 internal/upstream/client.go
+// （MIT License, Copyright (c) 2026 Sliverkiss），仅改名与裁剪注释。
 //
 // 为什么必须与授权失效分开：WAF 拦的是出口 IP 而非账号，账号本身健康。
 // 若按授权失效处理会 disableAccount → os.Remove(凭据文件)，把有效期数月甚至
@@ -3780,6 +3786,9 @@ func (g *degradeGate) Trigger() {
 // nextMidnightCST 返回 now 之后最近的 Asia/Shanghai 00:00 时刻。
 // 用固定 +08:00 偏移计算，避免依赖系统时区配置（容器/宿主机时区不确定）。
 // 边界：23:59 → 次日 00:00；00:00 → 次日 00:00（刚过零点，下个零点是次日）。
+//
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/server/degrade.go
+// （MIT License, Copyright (c) 2026 Sliverkiss），逐字保留。
 func nextMidnightCST(now time.Time) time.Time {
 	cst := time.FixedZone("CST", 8*60*60)
 	y, m, d := now.In(cst).Date()
@@ -3961,6 +3970,11 @@ func roleOfMessage(m any) string {
 
 // -----------------------------------------------------------------------------
 // 出站请求体指纹脱敏
+//
+// 来源：逐字移植自 Sliverkiss/workbuddy2api 的 internal/upstream/sanitize.go
+// （MIT License, Copyright (c) 2026 Sliverkiss），仅按本仓库的调用点做了
+// 函数签名适配（sanitizeMessages 接收 map 而非 []any）。许可全文见 README
+// 「代码来源与许可」章节。
 //
 // 背景：客户端（Claude Code / Codex 类 CLI）会在 system prompt 注入若干固定模板句，
 // 上游内容审核按**逐字精确匹配**拦截（非语义审核），一字改动即可绕过。

@@ -14,8 +14,129 @@
 
 ---
 
+## 代码来源与许可
+
+本仓库是 [**CangShui/workbuddy-gateway**](https://github.com/CangShui/workbuddy-gateway) 的二次开发分支（fork），
+并从 [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api)（MIT 许可）移植了
+错误分类、指纹脱敏与成本调度相关实现。两者面向同一套上游协议，实现路线不同。
+
+### 与两个上游仓库的关系
+
+| 仓库 | 角色 | 协议实现 | 许可 |
+|---|---|---|---|
+| [CangShui/workbuddy-gateway](https://github.com/CangShui/workbuddy-gateway) | **代码基线**（本仓库的 fork 来源） | 腾讯 CodeBuddy `/v2/plugin/*`（国内站 + 国际站） | 仓库未附许可文件 |
+| [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | **部分代码来源**（错误分类 / 脱敏 / 成本调度，见「许可与署名」） | 同一套 WorkBuddy 上游协议 | MIT |
+| 本仓库 | 基线 + 二次开发 | 同基线，叠加下述改动 | 见「许可与署名」 |
+
+### 基线与二次开发的边界
+
+截至 `v1.12.0`（提交 `9eb5c65`）之前的全部代码、文档与提交历史来自 **CangShui/workbuddy-gateway**，
+本仓库完整保留其 git 历史与原作者署名。此后的提交（`bd7b329` 起）为二次开发内容：
+
+| 提交 | 内容 | 来源 |
+|---|---|---|
+| `bd7b329` | WAF 403 与授权失效分流，避免 WAF 拦截页误删凭据 | 修复基线缺陷；判定口径取自 wb2api |
+| `680a944` | `errKind` 错误分类体系（13 个常量，区分账号故障与请求故障） | 移植 wb2api 的 `ErrKind` |
+| `9cee7a6` | 指纹脱敏（修复基线中恒为 no-op 的实现） | **移植 wb2api 的 `sanitize.go`（MIT）** |
+| `a9be76a` | 会话头族 + 内容拦截降级重试 | 移植 wb2api 的 `X-Conversation-Request-ID` 与降级重试思路 |
+| `df4556c` | 成本账本分层选号 + 多代理池 | 移植 wb2api 的 costTier 与 issue #136 方案 a′ |
+| `8abcaf3` | CI：推送 tag 自动发布 Linux 产物 | 本仓库新增 |
+
+设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
+
+### 移植原则
+
+二次开发**保留基线的调度架构**，并按 wb2api 的设计思路补齐错误处理与成本调度：
+
+- **保留基线的串行调度**：单账号严格串行（`acc.lock` 包住整个上游调用）是抗 WAF 的核心，不可动。
+- **裁剪移植范围**：wb2api 的并发调度、六类定时任务（含活跃地图连发）本身是风控特征，明确不移植。
+- **保持依赖极简**：仅 `go-qrcode` + `google/uuid`，零 CGO。
+
+### 许可与署名
+
+| 来源 | 许可 | 本仓库的使用方式 |
+|---|---|---|
+| CangShui/workbuddy-gateway | 未附许可文件 | 本仓库的代码基线（fork 来源，含完整 git 历史） |
+| **Sliverkiss/workbuddy2api** | **MIT** | 见下方「逐字移植清单」 |
+| 本仓库 | 沿用基线分发方式 | 二次开发部分（提交 `bd7b329` 起） |
+
+**逐字移植清单**（经与 wb2api 源码逐函数比对确认）：
+
+| 位置 | 来源文件 | 比对结果 |
+|---|---|---|
+| `sanitizeFeatures` / `sanitizeHdrRe` / `sanitizeBareHdrRe` / `sanitizeKvRe` / `sanitizeText` / `hasFingerprint` / `sanitizeContent` / `sanitizeToolCalls` | `internal/upstream/sanitize.go` | 代码逐字相同（正则表、替换表、注释一致） |
+| `sanitizeRewrites` | 同上 | 99.1%（仅注释措辞微调） |
+| `hasBusinessEnvelope` | `internal/upstream/client.go` | 逐字相同 |
+| `isWafBlocked` | 同上（原名 `IsWafBlocked`） | 95.9%（仅改名与注释裁剪） |
+| `nextMidnightCST` | `internal/server/degrade.go` | 逐字相同（仅删去一行注释） |
+
+其余移植项（`errKind` 分类体系、成本分层选号、会话头族、内容拦截降级、多代理池）
+为**按设计思路的裁剪重实现**，非逐字复制：结构对齐 wb2api 的调度语义，
+但按基线的串行架构重写，函数名、数据流与判定顺序均不同。
+
+> **MIT 许可声明**：本仓库包含来自 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的代码，
+> 版权归其作者所有，依 MIT 许可使用：
+>
+> ```
+> MIT License
+>
+> Copyright (c) 2026 Sliverkiss
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+> ```
+>
+> 基线仓库未附许可文件，本仓库作为 fork 沿用其分发方式。若你是权利人就许可问题有疑问，请通过 issue 联系。
+
+### 两个上游仓库的协议关系
+
+两者**面向同一套腾讯上游协议**，因此本仓库可以把 wb2api 的错误判定口径直接接过来：
+
+| 协议端点 | 路径 | 说明 |
+|---|---|---|
+| 登录状态 / 账号 / 换码 | `/v2/plugin/auth/state`、`/v2/plugin/login/account`、`/v2/plugin/auth/token` | 扫码登录族，国内站用微信 / 企业微信 |
+| Token 刷新 | `/v2/plugin/auth/token/refresh` | 凭据续期，按 `edition` 路由到对应站点 |
+| 对话 | `/v2/chat/completions` | 上游统一入口，请求 / 响应结构一致 |
+| 模型目录 | `/v2/enterprises/personal/models` | 实时接口，两站同路径 |
+| 额度与签到 | `/v2/billing/meter/get-user-resource`、`/v2/billing/meter/daily-checkin` | 国内站签到用；国际站跳过签到 |
+
+站点差异仅在 **Base 与登录方式**：
+
+```text
+国内站  Base = https://copilot.tencent.com     登录 = 扫码（终端 ASCII 二维码）
+国际站  Base = https://www.workbuddy.ai        登录 = 浏览器内完成（邮箱 / 验证码 / SSO）
+```
+
+两仓库的实现差异在**调度与错误处理**，不在协议层：
+
+| 维度 | CangShui/workbuddy-gateway（基线） | Sliverkiss/workbuddy2api |
+|---|---|---|
+| 并发模型 | 单账号严格串行（抗 WAF 的核心） | 多号并发 + 请求级轮换 |
+| 出口 | 单代理 `-proxy` | 无内置代理 |
+| 错误分类 | 8 个 `is*` 谓词（无统一枚举） | 13 个 `ErrKind` 常量 |
+| 指纹脱敏 | 无（本仓库已补） | `sanitize.go` 三层净化 |
+| 本仓库取舍 | **保留串行 + 引入 wb2api 的错误分类与脱敏** | — |
+
+---
+
 ## 目录
 
+- [代码来源与许可](#代码来源与许可)
 - [核心特性](#核心特性)
 - [命令总览](#命令总览)
 - [serve](#serve)
@@ -38,6 +159,8 @@
 
 ## 核心特性
 
+> 标注 ✦ 的条目为本仓库二次开发新增，其余为基线（CangShui/workbuddy-gateway）既有能力。
+
 - **国内 / 国际双站反代**：两个站点走同一套协议，凭据通过 `edition` 字段区分，刷新与对话自动路由到各自上游。
 - **模型完全透传**：客户端传什么 `model` 就原样中继到上游，无白名单限制。`/v1/models` 仅用于客户端自动补全，不影响实际转发。
 - **模型列表双来源合并**：实时接口 + npm 静态目录，按 ID 去重、接口优先；失败用本地缓存，两边都失败且无缓存时该站点本轮不展示模型（不影响调用）。
@@ -46,12 +169,17 @@
 - **模型级隔离**：`6004` 只冷却触发它的账号 + 模型，`14018` 只阻断该账号的当前收费模型，不再因为一个模型拖垮整个账号。
 - **免费站点优先**：同一模型若「一个站点免费、另一个站点收费」，优先使用免费站点账号直至其受限；两个站点都收费（仅倍率不同）时不做倾斜，正常轮询。
 - **免费/收费学习**：按「账号 + 模型」从响应 `usage.credit` 学习；`credit=0` 且样本足够（`total_tokens ≥ 100`）才判定免费，避免小样本误判。
+- ✦ **错误分类体系**：13 个 `errKind`（12 个实际分类 + `errNone` 兜底）区分「账号的问题」与「请求的问题」——前者冷却 / 禁用该账号并换号重试，后者不罚账号直接透传，避免把请求级错误记到账号头上。（移植 wb2api 的 `ErrKind`）
+- ✦ **WAF 拦截识别**：403 且响应体无业务信封（无 `code` / `msg` 字段）判定为 WAF 拦截形态，仅软冷却 60 秒、**不删除凭据**；带业务信封的 403 才走授权失效判定。（修复基线误删凭据缺陷）
+- ✦ **指纹脱敏**：出站请求体清洗上游内容审核拒绝的字面量（Claude Code / Codex 模板句、Anthropic 计费头键值对、`11-128` 字面量），改写单字破坏精确匹配而保留语义；覆盖 `content` / `reasoning_content` / `tool_calls.arguments` 三个字段。（基线实现恒为 no-op，本仓库修复）
+- ✦ **会话头族**：同一次用户操作内的所有上游尝试复用同一聚合主键（`X-Conversation-Request-ID` / `X-Root-Request-ID`），每次尝试独立的 message 级 ID，上游后台按对话轮聚合而非碎片化记录；附带 B3 trace 三元组。（移植 wb2api 思路）
+- ✦ **内容拦截降级重试**：passthrough / append 模式下首遇内容拦截时，切换到中性系统提示词（直至次日 CST 00:00）同请求重试一次，破解模板句指纹误报；custom 模式已是网关提示词，不进入降级。
 - **成本账本与分层选号**：每次成功请求按 `usage.credit` 折算每千 token 单价（EMA α=0.3 平滑、6 小时过期）记入「账号 + 模型」账本；选号时按 **免费 > 未知 > 收费** 硬过滤分层，收费层内单价低者优先，避免把流量浪费在贵号上。
-- **成本条件探索（反垄断）**：免费层账号垄断某模型时，未知层账号永远轮不到、也就永远学不到属性。默认每 30 分钟（`-cost-explore-interval`，0 关停）把**一次真实用户请求**改道给未知账号搭车学习——零新增上游调用，学成即毕业；探索失败自动回退，不影响本次请求。
-- **多代理池**：`-proxies` 配置多个出口代理，账号按凭据文件名稳定散列绑定到其中一个出口 IP，单 IP 风控不再同时命中全部账号。
+- ✦ **成本条件探索（反垄断）**：免费层账号垄断某模型时，未知层账号永远轮不到、也就永远学不到属性。默认每 30 分钟（`-cost-explore-interval`，0 关停）把**一次真实用户请求**改道给未知账号搭车学习——零新增上游调用，学成即毕业；探索失败自动回退，不影响本次请求。（移植 wb2api issue #136 方案 a′）
+- ✦ **多代理池**：`-proxies` 配置多个出口代理，账号按凭据文件名稳定散列绑定到其中一个出口 IP，单 IP 风控不再同时命中全部账号。
 - **国内站每日自动签到**：服务启动、凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；国际站跳过。
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
-- **授权失效自动禁用**：401/403 / `invalid token` / 登录过期时禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复。
+- **授权失效自动禁用**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复；**WAF 形态的 403 不在此列**。
 - **后台自动续期**：每 5 分钟检查 Token，距过期不足 15 分钟自动刷新并写回凭据文件。
 - **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免 Anthropic 翻译层误判 `stop_reason` 导致工具不执行。
 - **OpenAI 兼容协议**：`/v1/chat/completions`（SSE 流式 + 非流式聚合）、`/v1/responses`（Responses API）、`/v1/models`、`/health`。
@@ -392,7 +520,7 @@ workbuddy-gateway serve -auth-dir ./auths
 
 - **轮询**：请求按 round-robin 在可用账号间分发。
 - **429 冷却**：`6004` 只冷却触发模型；无法归因到模型的 429 才进入账号级冷却，冷却到期自动恢复。
-- **授权失效**：401/403 类错误禁用账号并删除凭据文件，同时写 `*.disabled` 标记；重新 `login` 后自动恢复。
+- **授权失效**：401，或 403 携带业务信封且命中失效文案时，禁用账号并删除凭据文件，同时写 `*.disabled` 标记；重新 `login` 后自动恢复。WAF 形态的 403（无业务信封）只软冷却，不删凭据。
 - **额度耗尽**：`剩余=0` 标记「付费耗尽」，仍可服务已确认免费的模型。
 - **热加载**：默认每 5 秒扫描，新增 / 更新 / 删除凭据免重启。
 - **串行化**：同一账号请求严格排队，避免并发双发触发风控；不同账号可并行。
@@ -491,9 +619,20 @@ llm-pi-ai:
 
 ## 各平台部署
 
+> **产物来源说明**：本仓库的 CI 仅构建并发布 **Linux** 产物（`amd64` / `arm64`），
+> 见 [本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases)。
+> Windows / macOS 产物请从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases)下载，
+> 或按[从源码构建](#从源码构建)自行交叉编译（两者命令行接口一致）。
+
 ### Windows
 
-1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`。
+1. 从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`，或本地交叉编译：
+
+   ```powershell
+   $env:GOOS='windows'; $env:GOARCH='amd64'; $env:CGO_ENABLED='0'
+   go build -trimpath -ldflags '-s -w' -o dist\workbuddy-gateway-windows-amd64.exe .
+   ```
+
 2. 在 PowerShell / CMD 中进入文件所在目录：
 
    ```powershell
@@ -505,13 +644,19 @@ llm-pi-ai:
 
 ### Linux
 
+从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest) 下载（含 `.sha256` 校验文件）：
+
 ```bash
 # x86_64
-wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-amd64
+wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-amd64
+wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-amd64.sha256
+sha256sum -c workbuddy-gateway-linux-amd64.sha256
 sudo install -m 755 workbuddy-gateway-linux-amd64 /usr/local/bin/workbuddy-gateway
 
 # ARM64
-wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-arm64
+wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-arm64
+wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-arm64.sha256
+sha256sum -c workbuddy-gateway-linux-arm64.sha256
 sudo install -m 755 workbuddy-gateway-linux-arm64 /usr/local/bin/workbuddy-gateway
 
 workbuddy-gateway login
@@ -573,7 +718,11 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ### macOS
 
-1. 下载 `workbuddy-gateway-darwin-arm64`（Apple Silicon）或 `workbuddy-gateway-darwin-amd64`（Intel）。
+1. 从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-darwin-arm64`（Apple Silicon）或 `workbuddy-gateway-darwin-amd64`（Intel）；也可本地交叉编译：
+
+   ```bash
+   GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-darwin-arm64 .
+   ```
 2. 移除隔离属性：
 
    ```bash
@@ -629,8 +778,8 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 需要 Go 1.26+（`go.mod` 要求 1.26.5）：
 
 ```bash
-git clone https://github.com/CangShui/workbuddy-gateway.git
-cd workbuddy-gateway
+git clone https://github.com/gakiyukr/workbuddy_to_api_plus.git
+cd workbuddy_to_api_plus
 
 go vet ./...
 go test ./...
@@ -668,3 +817,7 @@ git push origin main --follow-tags
 ## 免责声明
 
 本项目仅用于个人学习与技术研究。腾讯 CodeBuddy（含国内站与国际站 workbuddy.ai）的接口协议与风控策略可能随时变化；请遵守腾讯服务条款，自行承担使用风险。本仓库不包含任何官方未公开的密钥或凭据。
+
+本仓库是 [CangShui/workbuddy-gateway](https://github.com/CangShui/workbuddy-gateway) 的 fork，
+并包含移植自 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（MIT 许可）的代码，
+来源与许可详情见[代码来源与许可](#代码来源与许可)。
