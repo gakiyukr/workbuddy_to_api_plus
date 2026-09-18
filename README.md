@@ -32,6 +32,7 @@
 - [各平台部署](#各平台部署)
 - [安全提示](#安全提示)
 - [从源码构建](#从源码构建)
+- [自动构建与发布](#自动构建与发布)
 
 ---
 
@@ -640,6 +641,26 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o workbuddy-gateway .
 # 交叉编译示例
 GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-linux-amd64 .
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-windows-amd64.exe .
+```
+
+---
+
+## 自动构建与发布
+
+推送 `v*` 形式的 tag 时，GitHub Actions（`.github/workflows/release.yml`）会自动：
+
+1. 运行 `go vet` + `go test`（不通过则中止，不发布坏产物）；
+2. 交叉编译 Linux 静态二进制（`amd64` / `arm64`，`CGO_ENABLED=0`）；
+3. 生成 `sha256` 校验文件并创建 GitHub Release，产物直接可下载。
+
+发布前会校验 tag 与 `main.go` 中的 `version` 常量一致，避免名实不符。发版流程：
+
+```bash
+# 1. bump main.go 中的 version 常量
+# 2. 提交后打 tag 并推送
+git commit -am "chore: bump version to 1.13.0"
+git tag -a v1.13.0 -m "WorkBuddy Local Gateway v1.13.0"
+git push origin main --follow-tags
 ```
 
 ---

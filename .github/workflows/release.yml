@@ -1,0 +1,134 @@
+# 推送版本 tag（v*）时自动构建 Linux 产物并发布 GitHub Release。
+#
+# 产物命名与 README「从源码构建」及 build.ps1 保持一致：
+#   workbuddy-gateway-linux-amd64 / workbuddy-gateway-linux-arm64
+# 构建前先跑 go vet + go test：测试不过就不发布，避免发出坏产物。
+#
+# 权限最小化：默认 workflow 权限为 read，发布 Release 需要显式授予 contents: write。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # 先验证，再构建：测试失败时构建作业根本不会启动。
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -count=1 ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build linux/${{ matrix.goarch }}
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+            -o workbuddy-gateway-linux-${{ matrix.goarch }} .
+
+      - name: Generate checksums
+        run: sha256sum workbuddy-gateway-linux-${{ matrix.goarch }} > workbuddy-gateway-linux-${{ matrix.goarch }}.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbuddy-gateway-linux-${{ matrix.goarch }}
+          path: |
+            workbuddy-gateway-linux-${{ matrix.goarch }}
+            workbuddy-gateway-linux-${{ matrix.goarch }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # 生成完整变更日志需要完整历史
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -la dist/
+
+      # 版本号取自 tag（v1.13.0 -> 1.13.0），并与 main.go 的 version 常量校验一致。
+      # 不一致说明发版流程漏了 bump，直接失败而不是发出名实不符的产物。
+      - name: Verify version matches tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          src=$(grep -oP 'version\s*=\s*"\K[^"]+' main.go | head -1)
+          echo "tag=$tag source=$src"
+          if [ "$tag" != "$src" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 main.go 的 version ($src) 不一致，请先 bump 版本号"
+            exit 1
+          fi
+
+      - name: Generate release notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # 上一个 tag 到本 tag 之间的提交，作为 Release 说明的变更列表。
+          prev=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || echo "")
+          {
+            echo "## WorkBuddy Local Gateway ${tag}"
+            echo
+            echo "### 产物"
+            echo
+            echo "| 文件 | 平台 |"
+            echo "|---|---|"
+            echo "| \`workbuddy-gateway-linux-amd64\` | Linux x86_64 |"
+            echo "| \`workbuddy-gateway-linux-arm64\` | Linux ARM64 |"
+            echo
+            echo "均为静态链接单二进制（CGO 关闭），下载后 \`chmod +x\` 即可运行；校验见同名 \`.sha256\` 文件。"
+            echo
+            echo "### 变更"
+            echo
+            if [ -n "$prev" ]; then
+              echo "自 \`${prev}\` 以来的提交："
+              echo
+              git log --no-merges --pretty='- %s' "${prev}..${tag}"
+            else
+              git log --no-merges --pretty='- %s' "${tag}"
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "WorkBuddy Local Gateway ${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            dist/workbuddy-gateway-linux-amd64 \
+            dist/workbuddy-gateway-linux-amd64.sha256 \
+            dist/workbuddy-gateway-linux-arm64 \
+            dist/workbuddy-gateway-linux-arm64.sha256
