@@ -14,6 +14,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -3236,6 +3237,80 @@ func authMiddleware(next http.Handler) http.Handler {
 // 路由处理: /v1/chat/completions (支持任意 model 透传)
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// 轮转退避与抖动
+//
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/server/backoff.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 目的：换号重试前先歇一下，让上游频控窗口滑过。立即连环重试会以固定节奏
+// 持续撞击 WAF 的密度判罚；抖动则打散多请求的同相位重试（齐步走的退避会
+// 以固定周期再次聚团）。
+// -----------------------------------------------------------------------------
+
+var (
+	// rotateBackoffBase 轮转退避基数（对齐官方 CLI 的 500ms 形态）。
+	// 测试可置 0 跳过等待。
+	rotateBackoffBase = 500 * time.Millisecond
+	// rotateBackoffJitter 抖动比例（±25%，对齐官方 CLI delay×(1±0.25) 形态）。
+	rotateBackoffJitter = 0.25
+)
+
+const (
+	// rotateBackoffCap 轮转退避封顶：轮转上限 = 池大小，封顶只约束大池的极端等待。
+	rotateBackoffCap = 8 * time.Second
+)
+
+// jitterDur 给时长施加 ±rotateBackoffJitter 的均匀抖动。
+// d<=0 原样返回（零等待不抖动）。
+func jitterDur(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	f := 1 + (rand.Float64()*2-1)*rotateBackoffJitter
+	out := time.Duration(float64(d) * f)
+	if out < 0 {
+		return 0
+	}
+	return out
+}
+
+// rotateBackoffDelay 返回第 n 次轮转（0 基：首次失败换号前 n=0）应等待的时长：
+// base·2^n 封顶 rotateBackoffCap，再施加 ±25% 抖动。base 置 0（测试）时恒 0。
+// 用逐次翻倍而非位移：base 调整后无需同步维护移位上限，溢出由封顶比较兜底。
+func rotateBackoffDelay(n int) time.Duration {
+	d := rotateBackoffBase
+	if d <= 0 {
+		return 0
+	}
+	for k := 0; k < n && d < rotateBackoffCap; k++ {
+		d *= 2
+		if d <= 0 { // 翻倍溢出成非正数：直接按封顶处理
+			return jitterDur(rotateBackoffCap)
+		}
+	}
+	if d > rotateBackoffCap {
+		d = rotateBackoffCap
+	}
+	return jitterDur(d)
+}
+
+// sleepCtx 可取消的等待：ctx 取消立即返回 false（客户端断连/优雅停机不必等退避
+// 睡醒），等满返回 true。d<=0 立即放行。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // upstreamChat 完成「多账号轮询 + 429 冷却代偿 + 授权失效禁用 + 单账号串行」的上游调度。
 // 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
 // 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
@@ -3266,6 +3341,17 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	currentBody := upstreamBytes
 	attempted := make(map[*Account]bool, poolSize)
 	for attempt := 0; attempt < poolSize; attempt++ {
+		// 轮转退避（第 2 次尝试起）：换号前先歇一下让上游频控窗口滑过。
+		// 首次尝试不等待（正常单号请求零开销）；ctx 取消（客户端断连/优雅停机）
+		// 立即终止轮转——客户端已走，换号重试无意义。
+		if attempt > 0 {
+			if d := rotateBackoffDelay(attempt - 1); d > 0 {
+				if !sleepCtx(r.Context(), d) {
+					log.Printf("[#%d] 轮转退避被中断（客户端断连或服务停机），终止换号重试", reqID)
+					return nil, nil, nil, false
+				}
+			}
+		}
 		acc, selection, err := nextAccountForModel(modelName, attempted)
 		if err != nil {
 			// 所有账号均不可用（冷却或失效）
@@ -4615,18 +4701,71 @@ func applyToolCallDelta(toolCalls map[int]*mergedToolCall, order *[]int, tcs []a
 	}
 }
 
+// -----------------------------------------------------------------------------
+// 工具调用的残缺参数检测
+//
+// 来源：逐字移植自 Sliverkiss/workbuddy2api 的 internal/upstream/truncation.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 背景：SSE 流被截断（连接中断 / finish_reason==length）时，工具调用的 arguments
+// 会只剩半截 JSON。此时网关若把脏参数原样交给客户端，客户端解析会报非法 JSON 并
+// 卡死会话。处置是丢弃残缺调用，而非补成 {} 伪造合法外观。
+//
+// 关键区分：只把「非空但无法解析」视为截断。空串是合法的无参数工具；能解析但类型
+// 不对（标量 / 数组）属于模型输出错误，交给客户端 schema 校验回传即可，不在此判定。
+// -----------------------------------------------------------------------------
+
+// isTruncatedArguments 判定工具参数字符串是否因分片丢失而残缺（区别于「该工具本就无参数」）。
+//   - 空串 / 纯空白 → false（合法无参工具）；
+//   - 非空但 JSON 解析失败 → true（截断）；
+//   - 能解析（含 null/标量/数组等任何合法 JSON）→ false。
+func isTruncatedArguments(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	var v any
+	return json.Unmarshal([]byte(trimmed), &v) != nil
+}
+
+// dropTruncatedToolCalls 过滤出 arguments 完整的 tool_call（返回新 slice）。
+// 只依据 isTruncatedArguments 判定，不改动任何保留的调用（正例零改动）。
+func dropTruncatedToolCalls(calls []map[string]any) []map[string]any {
+	kept := make([]map[string]any, 0, len(calls))
+	for _, call := range calls {
+		fn, _ := call["function"].(map[string]any)
+		if fn == nil {
+			kept = append(kept, call)
+			continue
+		}
+		args, _ := fn["arguments"].(string)
+		if isTruncatedArguments(args) {
+			continue
+		}
+		kept = append(kept, call)
+	}
+	return kept
+}
+
 func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
 	var usage map[string]any
 	toolCalls := map[int]*mergedToolCall{}
 	var toolOrder []int
+	// sawDone 记录是否收到 data: [DONE] 终止帧。EOF 收尾但未见 [DONE] 说明上游连接
+	// 中断，此时残留的 tool_call 分片是半截 JSON，必须丢弃（见下方 dropTruncatedToolCalls）。
+	sawDone := false
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			sawDone = true
 			continue
 		}
 		var chunk map[string]any
@@ -4690,7 +4829,17 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 				},
 			})
 		}
-		message["tool_calls"] = calls
+		// 流被截断时 tool_call 的 arguments 是残缺 JSON（解析失败），不把脏参数交给
+		// 客户端——残留分片会被客户端解析成非法 JSON 卡死会话。截断的两个来源：
+		//   - finish_reason=="length"（模型因 max_tokens 提前中止）；
+		//   - 上游连接中断（EOF 收尾但未发 data: [DONE]，sawDone=false）。
+		// 完整参数原样保留（正例零改动）；空参数（无参工具）不是截断，同样保留。
+		if finish == "length" || !sawDone {
+			calls = dropTruncatedToolCalls(calls)
+		}
+		if len(calls) > 0 {
+			message["tool_calls"] = calls
+		}
 	}
 	if created == 0 {
 		created = time.Now().Unix()

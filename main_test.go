@@ -26,6 +26,9 @@ func TestMain(m *testing.M) {
 	if err := os.Chdir(dir); err != nil {
 		panic(err)
 	}
+	// 轮转退避置 0：加速轮转类测试（真实退避会让每次换号多等 500ms·2^n）。
+	// 退避界断言测试自行临时恢复非 0 基数。
+	rotateBackoffBase = 0
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -2205,6 +2208,266 @@ func TestToolPairingEndToEndThroughChatHandler(t *testing.T) {
 		}
 	}
 	assertToolPairsContiguous(t, msgs)
+}
+
+// -----------------------------------------------------------------------------
+// 残缺工具参数检测测试
+// -----------------------------------------------------------------------------
+
+// 验证截断判定：只把「非空但无法解析」视为截断；空参数（无参工具）与任何合法
+// JSON（含 null/标量/数组）都不算。
+func TestIsTruncatedArguments(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"空串（无参工具）", "", false},
+		{"纯空白", "   \n\t ", false},
+		{"合法对象", `{"path":"a.txt"}`, false},
+		{"合法 null", "null", false},
+		{"合法标量", "42", false},
+		{"合法数组", "[1,2]", false},
+		{"半截对象（截断）", `{"path":"a.tx`, true},
+		{"半截字符串（截断）", `{"cmd":"echo`, true},
+		{"裸文本（非 JSON）", "not json at all", true},
+	}
+	for _, c := range cases {
+		if got := isTruncatedArguments(c.in); got != c.want {
+			t.Errorf("%s: isTruncatedArguments(%q) = %v, want %v", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+// 验证残缺调用被丢弃、完整调用原样保留（正例零改动）。
+func TestDropTruncatedToolCalls(t *testing.T) {
+	calls := []map[string]any{
+		{"id": "ok", "function": map[string]any{"name": "read", "arguments": `{"path":"a"}`}},
+		{"id": "cut", "function": map[string]any{"name": "write", "arguments": `{"path":"a`}},
+		{"id": "noargs", "function": map[string]any{"name": "ping", "arguments": ""}},
+	}
+	kept := dropTruncatedToolCalls(calls)
+	if len(kept) != 2 {
+		t.Fatalf("应保留 2 个完整调用，实际 %d: %#v", len(kept), kept)
+	}
+	if kept[0]["id"] != "ok" || kept[1]["id"] != "noargs" {
+		t.Fatalf("保留的应是 ok 与 noargs: %#v", kept)
+	}
+	// 保留项内容未被改动
+	fn, _ := kept[0]["function"].(map[string]any)
+	if fn["arguments"] != `{"path":"a"}` {
+		t.Fatalf("保留项参数被改动: %v", fn["arguments"])
+	}
+}
+
+// 验证聚合路径：EOF 截断（未见 [DONE]）时残缺调用被丢弃，不把脏参数交给客户端。
+func TestAggregateDropsTruncatedToolCallsOnEOF(t *testing.T) {
+	// 无 [DONE] 收尾：上游连接中断
+	stream := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\"}}]}}]}\n\n"
+	out, err := aggregateCompletion(strings.NewReader(stream), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if _, ok := msg["tool_calls"]; ok {
+		t.Fatalf("EOF 截断的残缺调用应被丢弃: %#v", msg["tool_calls"])
+	}
+}
+
+// 验证聚合路径：正常 [DONE] 收尾且参数完整时，调用原样保留（不误删）。
+func TestAggregateKeepsCompleteToolCallsOnDone(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	out, err := aggregateCompletion(strings.NewReader(stream), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	tcs, ok := msg["tool_calls"].([]any)
+	if !ok || len(tcs) != 1 {
+		t.Fatalf("完整调用应保留: %#v", msg["tool_calls"])
+	}
+}
+
+// 验证 finish_reason=="length"（模型因 max_tokens 中止）同样触发残缺丢弃。
+func TestAggregateDropsTruncatedOnLengthFinish(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"data\\\":\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	out, err := aggregateCompletion(strings.NewReader(stream), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if _, ok := msg["tool_calls"]; ok {
+		t.Fatalf("length 截断的残缺调用应被丢弃: %#v", msg["tool_calls"])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 轮转退避测试
+// -----------------------------------------------------------------------------
+
+// 验证退避时长：base·2^n 递增、封顶生效、抖动落在 ±25% 区间内。
+func TestRotateBackoffDelayBounds(t *testing.T) {
+	oldBase := rotateBackoffBase
+	rotateBackoffBase = 500 * time.Millisecond
+	defer func() { rotateBackoffBase = oldBase }()
+
+	// n=0 基准：500ms ±25% → [375ms, 625ms]
+	for range 20 {
+		d := rotateBackoffDelay(0)
+		if d < 375*time.Millisecond || d > 625*time.Millisecond {
+			t.Fatalf("n=0 退避越界: %v（期望 [375ms,625ms]）", d)
+		}
+	}
+	// 递增：n=1 的期望区间（1s ±25% → [750ms,1.25s]）应整体高于 n=0
+	for range 20 {
+		d := rotateBackoffDelay(1)
+		if d < 750*time.Millisecond || d > 1250*time.Millisecond {
+			t.Fatalf("n=1 退避越界: %v（期望 [750ms,1.25s]）", d)
+		}
+	}
+	// 封顶：大 n 不超 8s·1.25
+	for _, n := range []int{5, 10, 20, 100} {
+		for range 10 {
+			d := rotateBackoffDelay(n)
+			if d > time.Duration(float64(rotateBackoffCap)*1.25) {
+				t.Fatalf("n=%d 超过封顶抖动上界: %v", n, d)
+			}
+			if d <= 0 {
+				t.Fatalf("n=%d 退避应恒正: %v", n, d)
+			}
+		}
+	}
+}
+
+// 验证 base=0（测试模式）时退避恒 0，不引入等待。
+func TestRotateBackoffZeroBase(t *testing.T) {
+	oldBase := rotateBackoffBase
+	rotateBackoffBase = 0
+	defer func() { rotateBackoffBase = oldBase }()
+	for _, n := range []int{0, 1, 5} {
+		if d := rotateBackoffDelay(n); d != 0 {
+			t.Fatalf("base=0 时 n=%d 应恒 0，实际 %v", n, d)
+		}
+	}
+}
+
+// 验证 jitterDur 边界：d<=0 原样返回，正值落在 [d·0.75, d·1.25]。
+func TestJitterDurBounds(t *testing.T) {
+	if got := jitterDur(0); got != 0 {
+		t.Fatalf("jitterDur(0) 应为 0，实际 %v", got)
+	}
+	if got := jitterDur(-time.Second); got != -time.Second {
+		t.Fatalf("负值应原样返回，实际 %v", got)
+	}
+	base := 4 * time.Second
+	for range 50 {
+		d := jitterDur(base)
+		if d < 3*time.Second || d > 5*time.Second {
+			t.Fatalf("抖动越界: %v（期望 [3s,5s]）", d)
+		}
+	}
+}
+
+// 验证 sleepCtx：ctx 取消立即返回 false（不等满），未取消则等满返回 true。
+func TestSleepCtxCancel(t *testing.T) {
+	// 已取消的 ctx：即便 d>0 也立即返回 false
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if sleepCtx(ctx, 5*time.Second) {
+		t.Fatal("已取消的 ctx 应返回 false")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("已取消的 ctx 应立即返回，实际等待 %v", elapsed)
+	}
+	// d<=0 且 ctx 正常：立即返回 true
+	if !sleepCtx(context.Background(), 0) {
+		t.Fatal("d<=0 且 ctx 正常应返回 true")
+	}
+	// 未取消且短等待：等满返回 true
+	if !sleepCtx(context.Background(), 10*time.Millisecond) {
+		t.Fatal("未取消应等满返回 true")
+	}
+}
+
+// 验证轮转退避在真实请求链路上生效：上游首次 429 后换号，第二次尝试前有等待。
+func TestRotationBackoffAppliedBetweenAttempts(t *testing.T) {
+	chdirTemp(t)
+	oldBase := rotateBackoffBase
+	rotateBackoffBase = 40 * time.Millisecond // 恢复非 0 基数（TestMain 置 0）
+	defer func() { rotateBackoffBase = oldBase }()
+
+	var mu sync.Mutex
+	var stamps []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		stamps = append(stamps, time.Now())
+		n := len(stamps)
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"code":6004,"msg":"模型使用量已达上限，将在 1 秒后重置"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":500}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBaseURL, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	a := &Account{Path: "bk-a.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "a", ExpiresAt: time.Now().Add(time.Hour).Unix()}}}
+	b := &Account{Path: "bk-b.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "b", ExpiresAt: time.Now().Add(time.Hour).Unix()}}}
+	accounts, rrIndex = []*Account{a, b}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBaseURL, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"bk-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(stamps) != 2 {
+		t.Fatalf("应发生 2 次上游尝试，实际 %d", len(stamps))
+	}
+	gap := stamps[1].Sub(stamps[0])
+	// base=40ms、n=0 → 40ms ±25% = [30ms, 50ms]；放宽下界吸收调度抖动
+	if gap < 25*time.Millisecond {
+		t.Fatalf("两次尝试间隔 %v，退避未生效（期望 ≥25ms）", gap)
+	}
 }
 
 // -----------------------------------------------------------------------------
