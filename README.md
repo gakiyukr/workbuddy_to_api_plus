@@ -47,6 +47,7 @@
 | `0dcefa0` | 残缺工具参数检测 + 轮转退避与抖动 | 移植 wb2api 的 `truncation.go` / `backoff.go`（MIT） |
 | `aefbc39` | 流式工具名收敛 + 别名翻译 + `gateway_hint` | 移植 wb2api 的 `sse.go` / `payload.go` / `hint.go`（MIT） |
 | `0d18103` | `tool_choice` 归一化 + 档位降级 + 思维链回填 + 空闲掐流 + `/v1/models` 能力透出 | 移植 wb2api 的 `payload.go` / `thinking.go` / `idle.go` / 目录能力字段（MIT） |
+| `89781ca` | 修正超时分层：共享客户端默认安全、聊天路径显式 opt-out | 自研（修正 `0d18103` 引入的回归） |
 
 设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
 
