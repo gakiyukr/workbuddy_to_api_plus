@@ -46,6 +46,7 @@
 | `8d7e1d8` | tool 配对自愈（孤儿清理 + 结果块重排） | 移植 wb2api 的 `tool_pairing.go`（MIT） |
 | `0dcefa0` | 残缺工具参数检测 + 轮转退避与抖动 | 移植 wb2api 的 `truncation.go` / `backoff.go`（MIT） |
 | `aefbc39` | 流式工具名收敛 + 别名翻译 + `gateway_hint` | 移植 wb2api 的 `sse.go` / `payload.go` / `hint.go`（MIT） |
+| 待提交 | `tool_choice` 归一化 + 档位降级 + 思维链回填 + 空闲掐流 + `/v1/models` 能力透出 | 移植 wb2api 的 `payload.go` / `thinking.go` / `idle.go` / 目录能力字段（MIT） |
 
 设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
 
@@ -84,6 +85,12 @@
 | `stripToolCallNames` | `internal/upstream/sse.go` | 逐字相同（含注释） |
 | `translateMaxCompletionTokens` | `internal/upstream/payload.go` | 逐字相同（含注释） |
 | `gatewayHint` / `attachHintToErrorFrame` / `frameGatewayHint` | `internal/upstream/hint.go` | 按设计思路适配（合并 `FrameKind` 与 `GatewayHint` 为单一入口、裁剪 11133/11135 图片形态判定——本仓库无模型能力目录） |
+| `normalizeToolChoice` | `internal/upstream/payload.go` | 逐字相同（含注释） |
+| `normalizeReasoningEffort` / `effortRank` | 同上 | 按设计思路适配（新增 `off`/`none` 不上抬保护、值归一化写回；档位数据源改为上游实时目录而非静态表） |
+| `backfillReasoningContent` / `isDeepSeekModel` | `internal/upstream/thinking.go` | 逐字相同（含注释） |
+| `idleMonitoringBody` / `monitorBody` | `internal/upstream/idle.go` | 按设计思路适配（`monitorBody` 在 idle≤0 时仍承担 cancel 职责，调用方无需分支；新增三层超时拆分） |
+| `idleTick` | 同上 | 逐字相同（含注释） |
+| `firstCatalogEntry` / `supportedEffortsFor` | `internal/upstream/context_catalog.go` + `effort_catalog.go` | 按设计思路重写（不引入静态兜底表，档位一律以实时目录为准；跨站取并集） |
 
 其余移植项（`errKind` 分类体系、成本分层选号、会话头族、内容拦截降级、多代理池）
 为**按设计思路的裁剪重实现**，非逐字复制：结构对齐 wb2api 的调度语义，
@@ -205,6 +212,11 @@
 - ✦ **流式工具名收敛**：上游在**每一帧**重复下发 `tool_calls[].function.name`，累加型客户端（`name += ...`）会把工具名拼成 `BashBashBash` 导致工具调用失败。网关按 index 只保留首片的 `name` 键，后续分片删除该键——这是 OpenAI 官方流的真实形态，累加型（追加空串）与覆盖型（`??` 守卫保留旧值）客户端同时正确。（移植 wb2api 的 `stripToolCallNames`）
 - ✦ **`max_completion_tokens` 别名翻译**：OpenAI 新别名，上游只认 `max_tokens`，直接透传会 400（`11101`）。显式 `max_tokens` 优先（别名只删不译）、非正值与畸形值不翻译，别名一律删除。（移植 wb2api 的 `translateMaxCompletionTokens`）
 - ✦ **`error.gateway_hint` 附加说明**：错误响应中在 `error` 对象内**并列**附加网关视角的可操作说明（如「上下文超限，请减少历史」「WAF 拦截，等窗口过去再试」），`message` 永远是上游原文透传、绝不替换包装；未覆盖的错误形态不带该字段（不编造）。流式 error 帧同样附加。（移植 wb2api 的 `hint.go`）
+- ✦ **`tool_choice` 归一化**：上游把该字段定义为 **string**，而 OpenAI 官方 SDK 默认发对象形式（`{"type":"function","function":{"name":"x"}}`），直接透传会 400（`11101`）——用官方 SDK 的客户端此前全部失败。网关按上游类型改写：`function` 对象取 name 转字符串、`auto`/`required` 对象转对应字符串、`none` 删字段并抑制 `tools`/`functions`、无法识别一律删字段。（移植 wb2api 的 `normalizeToolChoice`）
+- ✦ **推理档位降级**：客户端传的档位模型不支持时（如对只支持到 `high` 的模型传 `max`）上游会 400。网关按上游实时目录下发的 `reasoning.supportedEfforts` 降到 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档（偏离最小）。**`off`/`none` 绝不上抬**——那会把客户端明确的「关闭思考」反转成开启，比透传更糟。未收录档位的模型一律透传（不猜测），snake/camel 双字段兼容。（移植 wb2api 的 `normalizeReasoningEffort`）
+- ✦ **DeepSeek 思维链回填**：多轮会话中历史 assistant 消息带过 `reasoning` 痕迹时，上游要求**所有** assistant 消息都带 `reasoning_content` 字段（可为空串），否则判会话不一致。网关检测到痕迹后为缺失者回填（有 `reasoning` 的复制、没有的补空串），已有值不覆盖；无痕迹时零改动（不白白加字段）。仅 deepseek 系模型生效。（移植 wb2api 的 `backfillReasoningContent`）
+- ✦ **流中空闲掐流**：上游建连并开始吐数据后中途静默挂住时，此前只能干等到整体超时——该连接与账号槽位一直被占。网关包装上游 body，活跃吐数据续命、静默超阈值（300s）即取消请求中断阻塞读。同时把超时拆成**三层**：`ResponseHeaderTimeout`（120s，首字节前换号）、`IdleTimeout`（300s，流中空闲）、`Client.Timeout = 0`（**刻意不设总时长**——长思考/长输出会被总时长硬切断，且切断点与上游行为无关）。短请求（npm 目录等）走独立的 180s 总时长客户端，不共享这套语义。（移植 wb2api 的 `idle.go`）
+- ✦ **`/v1/models` 能力透出**：模型条目附带上游声明的 `context_length` / `max_output_tokens` / `supports_images` / `supports_tool_call` / `reasoning_supported_efforts` / `reasoning_default_effort`，客户端可据此自动配置上下文预算与推理档位（不再盲传非法档位）。零值一律**省略字段**——不编造「假 131072」误导客户端提前截断、白白丢上下文。同时补上 npm 静态目录解析丢弃这些字段的缺陷（实时接口不可用时它是唯一来源）。（移植 wb2api 的 `context_catalog` / `effort_catalog` 思路）
 - **国内站每日自动签到**：服务启动、凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；国际站跳过。
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
 - **授权失效自动禁用**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复；**WAF 形态的 403 不在此列**。

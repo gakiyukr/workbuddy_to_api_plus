@@ -2793,6 +2793,532 @@ func TestChatHandlerTranslatesMaxCompletionTokens(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// tool_choice 归一化测试
+// -----------------------------------------------------------------------------
+
+// 验证 tool_choice 归一化：上游把该字段定义为 string，对象形式必须改写。
+// OpenAI 官方 SDK 默认发对象形式，直接透传会 400 code=11101。
+func TestNormalizeToolChoice(t *testing.T) {
+	cases := []struct {
+		name      string
+		tc        any
+		present   bool
+		want      any  // nil = 字段应被删除
+		wantTools bool // tools/functions 是否应保留
+	}{
+		{"字符串 auto 原样", "auto", true, "auto", true},
+		{"字符串 required 原样", "required", true, "required", true},
+		{"字符串 none 删字段并抑制工具", "none", true, nil, false},
+		{"字符串 NONE 大小写不敏感", "None", true, nil, false},
+		{"对象 none 同上", map[string]any{"type": "none"}, true, nil, false},
+		{"对象 auto 转字符串", map[string]any{"type": "auto"}, true, "auto", true},
+		{"对象 required 转字符串", map[string]any{"type": "required"}, true, "required", true},
+		{"对象 function 取嵌套 name", map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}}, true, "Bash", true},
+		{"对象 function 取顶层 name", map[string]any{"type": "function", "name": "Read"}, true, "Read", true},
+		{"对象 function 无 name 回落 auto", map[string]any{"type": "function"}, true, "auto", true},
+		{"对象 function 空 name 回落 auto", map[string]any{"type": "function", "function": map[string]any{"name": "  "}}, true, "auto", true},
+		{"未知 type 删字段", map[string]any{"type": "weird"}, true, nil, true},
+		{"非标量（数组）删字段", []any{"a"}, true, nil, true},
+		{"数字删字段", float64(1), true, nil, true},
+	}
+	for _, c := range cases {
+		obj := map[string]any{
+			"model":       "m",
+			"tools":       []any{map[string]any{"type": "function"}},
+			"functions":   []any{map[string]any{"name": "f"}},
+			"tool_choice": c.tc,
+		}
+		normalizeToolChoice(obj)
+		got, has := obj["tool_choice"]
+		if c.want == nil {
+			if has {
+				t.Errorf("%s: tool_choice 应被删除，实际 %#v", c.name, got)
+			}
+		} else if !has || got != c.want {
+			t.Errorf("%s: tool_choice = %#v, want %#v", c.name, got, c.want)
+		}
+		if _, ok := obj["tools"]; ok != c.wantTools {
+			t.Errorf("%s: tools 存在性 = %v, want %v", c.name, ok, c.wantTools)
+		}
+		if _, ok := obj["functions"]; ok != c.wantTools {
+			t.Errorf("%s: functions 存在性 = %v, want %v", c.name, ok, c.wantTools)
+		}
+	}
+
+	// 未携带 tool_choice：零改动（tools 保留）
+	obj := map[string]any{"tools": []any{map[string]any{"type": "function"}}}
+	normalizeToolChoice(obj)
+	if _, ok := obj["tools"]; !ok {
+		t.Fatal("未携带 tool_choice 时不应删 tools")
+	}
+}
+
+// 验证端到端：客户端用官方 SDK 的对象形式 tool_choice，上游收到字符串形式。
+func TestChatHandlerNormalizesObjectToolChoice(t *testing.T) {
+	chdirTemp(t)
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	acc := &Account{Path: "tc.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}}}
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"tool_choice":{"type":"function","function":{"name":"Bash"}},"tools":[{"type":"function","function":{"name":"Bash"}}],"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(got), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["tool_choice"] != "Bash" {
+		t.Fatalf("上游应收到字符串 tool_choice，实际 %#v", sent["tool_choice"])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// reasoning_effort 档位降级测试
+// -----------------------------------------------------------------------------
+
+// 验证档位降级：请求档位不支持时降到 ≤请求的最高支持档；全部高于请求时取最低。
+func TestNormalizeReasoningEffort(t *testing.T) {
+	efforts := map[string][]string{"m": {"low", "high"}}
+	cases := []struct {
+		name string
+		obj  map[string]any
+		want any
+	}{
+		{"支持档原样透传", map[string]any{"model": "m", "reasoning_effort": "high"}, "high"},
+		{"max 降到 high", map[string]any{"model": "m", "reasoning_effort": "max"}, "high"},
+		{"xhigh 降到 high", map[string]any{"model": "m", "reasoning_effort": "xhigh"}, "high"},
+		{"medium 降到 low", map[string]any{"model": "m", "reasoning_effort": "medium"}, "low"},
+		// off 是「关闭思考」，不得上抬成开启档（语义反转）。原值归一化后透传。
+		{"off 不上抬（语义反转防护）", map[string]any{"model": "m", "reasoning_effort": "off"}, "off"},
+		{"大小写与空白归一", map[string]any{"model": "m", "reasoning_effort": "  HIGH  "}, "high"},
+	}
+	for _, c := range cases {
+		obj := map[string]any{}
+		for k, v := range c.obj {
+			obj[k] = v
+		}
+		normalizeReasoningEffort(obj, efforts)
+		if obj["reasoning_effort"] != c.want {
+			t.Errorf("%s: reasoning_effort = %#v, want %#v", c.name, obj["reasoning_effort"], c.want)
+		}
+	}
+
+	// camel 字段同样处理（双字段兼容）
+	obj := map[string]any{"model": "m", "reasoningEffort": "max"}
+	normalizeReasoningEffort(obj, efforts)
+	if obj["reasoningEffort"] != "high" {
+		t.Fatalf("camel 字段应降级为 high，实际 %#v", obj["reasoningEffort"])
+	}
+	// snake 字段在场时优先处理 snake
+	obj = map[string]any{"model": "m", "reasoning_effort": "max", "reasoningEffort": "low"}
+	normalizeReasoningEffort(obj, efforts)
+	if obj["reasoning_effort"] != "high" {
+		t.Fatalf("应优先处理 snake 字段，实际 %#v", obj["reasoning_effort"])
+	}
+	if obj["reasoningEffort"] != "low" {
+		t.Fatalf("camel 字段不应被改动，实际 %#v", obj["reasoningEffort"])
+	}
+
+	// 未知档位透传（不猜测）
+	obj = map[string]any{"model": "m", "reasoning_effort": "bogus"}
+	normalizeReasoningEffort(obj, efforts)
+	if obj["reasoning_effort"] != "bogus" {
+		t.Fatalf("未知档位应透传，实际 %#v", obj["reasoning_effort"])
+	}
+	// 未知模型透传
+	obj = map[string]any{"model": "other", "reasoning_effort": "max"}
+	normalizeReasoningEffort(obj, efforts)
+	if obj["reasoning_effort"] != "max" {
+		t.Fatalf("未收录模型应透传，实际 %#v", obj["reasoning_effort"])
+	}
+	// 未携带字段零改动
+	obj = map[string]any{"model": "m"}
+	normalizeReasoningEffort(obj, efforts)
+	if _, ok := obj["reasoning_effort"]; ok {
+		t.Fatal("未携带字段不应新增")
+	}
+	// 空档位表零改动
+	obj = map[string]any{"model": "m", "reasoning_effort": "max"}
+	normalizeReasoningEffort(obj, nil)
+	if obj["reasoning_effort"] != "max" {
+		t.Fatal("空档位表应透传")
+	}
+	// 非字符串档位透传
+	obj = map[string]any{"model": "m", "reasoning_effort": float64(3)}
+	normalizeReasoningEffort(obj, efforts)
+	if obj["reasoning_effort"] != float64(3) {
+		t.Fatal("非字符串档位应透传")
+	}
+}
+
+// 验证「支持档全部高于请求档」时取最低支持档（偏离最小）。
+func TestNormalizeReasoningEffortFloorsToLowest(t *testing.T) {
+	obj := map[string]any{"model": "m", "reasoning_effort": "minimal"}
+	normalizeReasoningEffort(obj, map[string][]string{"m": {"high", "xhigh"}})
+	if obj["reasoning_effort"] != "high" {
+		t.Fatalf("应取最低支持档 high，实际 %#v", obj["reasoning_effort"])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// DeepSeek reasoning_content 回填测试
+// -----------------------------------------------------------------------------
+
+// 验证回填：有 reasoning 痕迹时所有 assistant 消息补齐 reasoning_content。
+func TestBackfillReasoningContent(t *testing.T) {
+	// 无痕迹：零改动
+	obj := map[string]any{"model": "deepseek-v4-pro", "messages": []any{
+		map[string]any{"role": "assistant", "content": "a"},
+	}}
+	backfillReasoningContent(obj)
+	msgs := obj["messages"].([]any)
+	if _, ok := msgs[0].(map[string]any)["reasoning_content"]; ok {
+		t.Fatal("无 reasoning 痕迹时不应加字段")
+	}
+
+	// 有痕迹：所有 assistant 补齐（有 reasoning 的复制，没有的补空串）
+	obj = map[string]any{"model": "deepseek-v4-pro", "messages": []any{
+		map[string]any{"role": "user", "content": "q"},
+		map[string]any{"role": "assistant", "content": "a1", "reasoning": "thought-1"},
+		map[string]any{"role": "assistant", "content": "a2"},
+	}}
+	backfillReasoningContent(obj)
+	msgs = obj["messages"].([]any)
+	if got := msgs[1].(map[string]any)["reasoning_content"]; got != "thought-1" {
+		t.Fatalf("应复制 reasoning 值，实际 %#v", got)
+	}
+	if got := msgs[2].(map[string]any)["reasoning_content"]; got != "" {
+		t.Fatalf("无 reasoning 的 assistant 应补空串，实际 %#v", got)
+	}
+	// user 消息不动
+	if _, ok := msgs[0].(map[string]any)["reasoning_content"]; ok {
+		t.Fatal("非 assistant 消息不应被加字段")
+	}
+
+	// 已有 reasoning_content：不覆盖
+	obj = map[string]any{"model": "deepseek-v4-pro", "messages": []any{
+		map[string]any{"role": "assistant", "content": "a1", "reasoning": "new", "reasoning_content": "existing"},
+	}}
+	backfillReasoningContent(obj)
+	if got := obj["messages"].([]any)[0].(map[string]any)["reasoning_content"]; got != "existing" {
+		t.Fatalf("已有 reasoning_content 不应被覆盖，实际 %#v", got)
+	}
+
+	// 非 deepseek 模型：零改动
+	obj = map[string]any{"model": "hy4-preview", "messages": []any{
+		map[string]any{"role": "assistant", "content": "a", "reasoning": "thought"},
+	}}
+	backfillReasoningContent(obj)
+	if _, ok := obj["messages"].([]any)[0].(map[string]any)["reasoning_content"]; ok {
+		t.Fatal("非 deepseek 模型不应回填")
+	}
+
+	// 空 messages / 畸形：不 panic
+	backfillReasoningContent(map[string]any{"model": "deepseek-v4-pro"})
+	backfillReasoningContent(map[string]any{"model": "deepseek-v4-pro", "messages": "not-array"})
+	backfillReasoningContent(map[string]any{"model": "deepseek-v4-pro", "messages": []any{"not-map"}})
+}
+
+// -----------------------------------------------------------------------------
+// 流中空闲监控测试
+// -----------------------------------------------------------------------------
+
+// onceCancel 构造幂等的 cancel 闭包：真实 context.CancelFunc 可重复调用，
+// 测试替身必须同语义，否则 monitorBody 的 Close 与空闲触发会二次 close panic。
+func onceCancel(ch chan struct{}) context.CancelFunc {
+	var once sync.Once
+	return func() { once.Do(func() { close(ch) }) }
+}
+
+// 验证 idleTick 周期钳制：idle/4，钳在 [10ms, 1s]。
+func TestIdleTickBounds(t *testing.T) {
+	cases := []struct {
+		idle time.Duration
+		want time.Duration
+	}{
+		{4 * time.Millisecond, 10 * time.Millisecond},  // 下限钳制
+		{40 * time.Millisecond, 10 * time.Millisecond}, // idle/4 = 10ms
+		{400 * time.Millisecond, 100 * time.Millisecond},
+		{8 * time.Second, time.Second}, // 上限钳制
+		{4 * time.Second, time.Second},
+	}
+	for _, c := range cases {
+		if got := idleTick(c.idle); got != c.want {
+			t.Errorf("idleTick(%v) = %v, want %v", c.idle, got, c.want)
+		}
+	}
+}
+
+// 验证空闲监控：静默超阈值时 cancel 被调用；活跃读数据则续命不掐。
+//
+// 用真实 HTTP 响应体而非 io.Pipe：Pipe 是无缓冲同步的，Write 会阻塞到 Read，
+// 无法构造「静默挂住」与「持续吐数据」两种形态。
+func TestMonitorBodyCancelsOnIdle(t *testing.T) {
+	// 静默流：上游返回响应头后不再吐数据 → 空闲监控应掐断
+	quiet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(5 * time.Second) // 远超空闲阈值
+	}))
+	defer quiet.Close()
+
+	// 这里传**真实** context.CancelFunc 而非替身：解除 Read 阻塞依赖 transport
+	// 感知 context，替身闭包只能观测「被调用」，无法复现真实掐断语义。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, quiet.URL, nil)
+	resp, err := quiet.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := monitorBody(resp.Body, 50*time.Millisecond, cancel)
+	defer body.Close()
+
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, err := body.Read(buf)
+		readErr <- err
+	}()
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Fatal("掐断后 Read 应返回错误")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("空闲超时应解除 Read 阻塞")
+	}
+
+	// 活跃流：持续吐数据（间隔小于空闲阈值）→ 不应掐断
+	busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		fl.Flush()
+		for i := 0; i < 8; i++ {
+			_, _ = io.WriteString(w, "data: x\n\n")
+			fl.Flush()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}))
+	defer busy.Close()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	req2, _ := http.NewRequestWithContext(ctx2, http.MethodGet, busy.URL, nil)
+	resp2, err := busy.Client().Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled2 := make(chan struct{})
+	body2 := monitorBody(resp2.Body, 200*time.Millisecond, onceCancel(cancelled2))
+	defer body2.Close()
+
+	buf := make([]byte, 256)
+	deadline := time.Now().Add(3 * time.Second)
+	reads := 0
+	for time.Now().Before(deadline) {
+		n, err := body2.Read(buf)
+		reads += n
+		if err != nil {
+			break
+		}
+	}
+	if reads == 0 {
+		t.Fatal("活跃流应能读到数据")
+	}
+	select {
+	case <-cancelled2:
+		t.Fatal("活跃流不应被掐断")
+	default:
+	}
+}
+
+// 验证 monitorBody 的 Close 停掉监控并 cancel（无 goroutine 泄漏）。
+func TestMonitorBodyCloseStopsMonitor(t *testing.T) {
+	pr, _ := io.Pipe()
+	cancelled := make(chan struct{})
+	body := monitorBody(pr, 50*time.Millisecond, onceCancel(cancelled))
+	if err := body.Close(); err != nil && err != io.ErrClosedPipe {
+		t.Fatalf("Close 失败: %v", err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("Close 应调用 cancel")
+	}
+}
+
+// 验证 idle<=0 时禁用空闲掐流（仍负责 cancel，语义与启用时一致）。
+func TestMonitorBodyIdleDisabled(t *testing.T) {
+	pr, _ := io.Pipe()
+	cancelled := make(chan struct{})
+	body := monitorBody(pr, 0, onceCancel(cancelled))
+	// 静默期内不应触发 cancel
+	time.Sleep(80 * time.Millisecond)
+	select {
+	case <-cancelled:
+		t.Fatal("idle<=0 时不应掐流")
+	default:
+	}
+	_ = body.Close()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("Close 应调用 cancel")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// /v1/models 能力透出测试
+// -----------------------------------------------------------------------------
+
+// 验证 /v1/models 透出上下文窗口与能力旗标；零值一律省略（不编造）。
+func TestHandleModelsExposesCapabilities(t *testing.T) {
+	chdirTemp(t)
+	modelsMu.Lock()
+	oldCatalog := catalogModels
+	catalogModels = map[string][]catalogModel{
+		"cn": {
+			{ID: "full", MaxInputTokens: 1000000, MaxOutputTokens: 384000,
+				SupportsImages: true, SupportsToolCall: true,
+				SupportedEfforts: []string{"low", "high"}, DefaultEffort: "high"},
+			{ID: "bare"},
+		},
+	}
+	modelsMu.Unlock()
+	defer func() {
+		modelsMu.Lock()
+		catalogModels = oldCatalog
+		modelsMu.Unlock()
+	}()
+
+	rec := httptest.NewRecorder()
+	handleModels(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]map[string]any{}
+	for _, m := range resp.Data {
+		byID[m["id"].(string)] = m
+	}
+
+	full := byID["full"]
+	if full["context_length"] != float64(1000000) {
+		t.Errorf("context_length = %#v", full["context_length"])
+	}
+	if full["max_output_tokens"] != float64(384000) {
+		t.Errorf("max_output_tokens = %#v", full["max_output_tokens"])
+	}
+	if full["supports_images"] != true || full["supports_tool_call"] != true {
+		t.Errorf("能力旗标缺失: %#v", full)
+	}
+	efforts, ok := full["reasoning_supported_efforts"].([]any)
+	if !ok || len(efforts) != 2 {
+		t.Errorf("档位列表缺失: %#v", full["reasoning_supported_efforts"])
+	}
+	if full["reasoning_default_effort"] != "high" {
+		t.Errorf("默认档位缺失: %#v", full["reasoning_default_effort"])
+	}
+
+	// 零值模型：全部字段省略，不编造
+	bare := byID["bare"]
+	for _, k := range []string{"context_length", "max_output_tokens", "supports_images", "supports_tool_call", "reasoning_supported_efforts", "reasoning_default_effort"} {
+		if _, ok := bare[k]; ok {
+			t.Errorf("零值模型不应带字段 %s: %#v", k, bare[k])
+		}
+	}
+	if bare["object"] != "model" {
+		t.Errorf("基础字段应保留: %#v", bare)
+	}
+}
+
+// 验证 supportedEffortsFor 取各站点并集（跨站请求不被误降级）。
+func TestSupportedEffortsForUnionsSites(t *testing.T) {
+	chdirTemp(t)
+	modelsMu.Lock()
+	oldCatalog := catalogModels
+	catalogModels = map[string][]catalogModel{
+		"cn":   {{ID: "m", SupportedEfforts: []string{"low", "high", "max"}}},
+		"intl": {{ID: "m", SupportedEfforts: []string{"high"}}},
+	}
+	modelsMu.Unlock()
+	defer func() {
+		modelsMu.Lock()
+		catalogModels = oldCatalog
+		modelsMu.Unlock()
+	}()
+
+	got := supportedEffortsFor("m")
+	if len(got["m"]) != 3 {
+		t.Fatalf("应取并集 3 档，实际 %#v", got["m"])
+	}
+	// 未收录 → nil（调用方一律透传）
+	if got := supportedEffortsFor("unknown"); got != nil {
+		t.Fatalf("未收录模型应返回 nil，实际 %#v", got)
+	}
+}
+
+// 验证 npm 静态目录解析保留能力字段（实时接口不可用时是唯一窗口来源）。
+func TestParseNPMCatalogKeepsCapabilities(t *testing.T) {
+	data := []byte(`{"models":[
+		{"id":"m1","name":"M1","credits":"x1.00 credits","maxInputTokens":1000000,"maxOutputTokens":384000,"supportsImages":true,"supportsToolCall":true},
+		{"id":"m2","name":"M2"}
+	]}`)
+	models, err := parseNPMCatalog(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("模型数 = %d", len(models))
+	}
+	if models[0].MaxInputTokens != 1000000 || models[0].MaxOutputTokens != 384000 {
+		t.Fatalf("窗口字段丢失: %#v", models[0])
+	}
+	if !models[0].SupportsImages || !models[0].SupportsToolCall {
+		t.Fatalf("能力旗标丢失: %#v", models[0])
+	}
+	if models[1].MaxInputTokens != 0 {
+		t.Fatalf("未声明字段应为零值: %#v", models[1])
+	}
+}
+
+// -----------------------------------------------------------------------------
 // 会话头族测试
 // -----------------------------------------------------------------------------
 

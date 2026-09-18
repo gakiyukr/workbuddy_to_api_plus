@@ -269,6 +269,36 @@ const (
 	// 60s 后通常已恢复。
 	wafCooldownBase = 60 * time.Second
 
+	// upstreamHeaderTimeout 首字节超时：从请求写完到响应头返回的等待上限。
+	//
+	// 语义是「首字节前换号」——上游建连后迟迟不返回响应头（网络卡顿 / 上游排队）
+	// 时中断本次尝试，让轮转换下一个账号继续，而不是让客户端干等。
+	// 取值对齐 wb2api 的 Upstream.TimeoutSeconds 默认（120s）：足够覆盖上游
+	// 排队 + 冷启动，又不至于让客户端长时间无响应。
+	upstreamHeaderTimeout = 120 * time.Second
+
+	// upstreamIdleTimeout 流中空闲超时：上游开始吐数据后，相邻两次读之间的最大间隔。
+	//
+	// 与首字节超时分工明确：首字节由 Transport.ResponseHeaderTimeout 管，此处只管
+	// 「已经开流但中途卡住」。活跃吐数据（长思考、长输出）一律续命不掐——这正是
+	// 不能设 Client.Timeout 总时长的原因（见 initHTTPClient）。
+	//
+	// 取值对齐 wb2api 的 Upstream.IdleTimeoutSeconds 默认（300s）：模型长思考
+	// 期间可能数十秒无输出，阈值必须显著高于正常思考间隙，否则会误杀健康流。
+	upstreamIdleTimeout = 300 * time.Second
+
+	// upstreamNonStreamTimeout 非流式路径的整体超时（聚合上游 SSE 为完整响应）。
+	//
+	// 非流式请求没有「持续吐数据」的中间态，客户端等的就是最终结果，因此用整体
+	// 超时兜底：超过即放弃并返回错误，避免客户端无限等待。上限设为空闲超时 + 余量。
+	upstreamNonStreamTimeout = upstreamIdleTimeout + 60*time.Second
+
+	// upstreamShortTimeout 短请求的整体超时（npm 目录拉取等无 ctx 超时的调用）。
+	//
+	// 这些请求没有「流中续命」语义，必须靠总时长兜底：一个挂死的连接会永久占住
+	// 调用方的 goroutine。取值与旧版 Client.Timeout 一致（180s），覆盖大文件下载。
+	upstreamShortTimeout = 180 * time.Second
+
 	// accountFaultCooldown 账号级授权/配额故障的冷却时长。
 	//
 	// 适用 11140 request illegal / 14017 trial 未激活这类由账号自身状态决定的错误：
@@ -343,6 +373,8 @@ var (
 
 	// proxyClients 多代理池的 HTTP 客户端表（代理 URL → 客户端，initHTTPClient 构建）。
 	proxyClients = map[string]*http.Client{}
+	// shortClient 短请求专用客户端（总时长兜底），见 initHTTPClient 的超时分层说明。
+	shortClient *http.Client
 
 	quotaScanTrigger = make(chan struct{}, 1)
 	checkinTrigger   = make(chan struct{}, 1)
@@ -552,6 +584,9 @@ func initHTTPClient() {
 			IdleConnTimeout:     90 * time.Second,
 			MaxIdleConnsPerHost: 10,
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
+			// 首字节阶段超时：只计「请求写完后到响应头返回」的等待，不覆盖 body 读取。
+			// 与 Client.Timeout 的分工见下方 initHTTPClient 的说明。
+			ResponseHeaderTimeout: upstreamHeaderTimeout,
 		}
 		if proxyURL != "" {
 			pURL, err := url.Parse(proxyURL)
@@ -566,8 +601,31 @@ func initHTTPClient() {
 	if err != nil {
 		log.Fatalf("错误: %v", err)
 	}
+	// 超时分三层，语义各自独立（对齐 wb2api 的分层设计）：
+	//
+	//  1. Transport.ResponseHeaderTimeout（upstreamHeaderTimeout）：首字节前换号。
+	//     上游建连后迟迟不返回响应头时中断，让轮转换下一个账号——这是「首字节前」
+	//     的唯一约束。
+	//  2. Client.Timeout = 0：**刻意不设总时长**。流式响应可能持续数分钟（长思考、
+	//     长输出），总时长会把正常的长流硬切断，且切断点与上游行为无关。
+	//  3. IdleTimeout（upstreamIdleTimeout）：流中空闲掐流。活跃吐数据续命，
+	//     静默超过阈值才断——这才是流式场景真正需要的保护。
+	//
+	// 因此该客户端只用于**聊天上游调用**（流式/聚合）。其余短请求（npm 目录、
+	// 凭据刷新、额度查询、签到）不得共用：它们没有流中续命的需求，必须靠总时长
+	// 兜底，否则一个挂死的连接会永久占住调用方的 goroutine。这些调用走
+	// shortClient（见下）。
 	cfg.HttpClient = &http.Client{
-		Timeout:   180 * time.Second,
+		Timeout:   0,
+		Transport: transport,
+		Jar:       jar,
+	}
+	// shortClient 短请求专用客户端：与上游客户端共享 transport 与 cookie jar，
+	// 但设总时长兜底。供无自建 ctx 超时的调用使用（当前唯一用户是 npm 目录拉取）。
+	// 自建 ctx 超时的调用（doJSONContext 的调用方、probe、价格探测）可继续用
+	// cfg.HttpClient——它们的 ctx 已提供等价保护。
+	shortClient = &http.Client{
+		Timeout:   upstreamShortTimeout,
 		Transport: transport,
 		Jar:       jar,
 	}
@@ -581,11 +639,20 @@ func initHTTPClient() {
 			log.Fatalf("错误: %v", err)
 		}
 		proxyClients[proxyURL] = &http.Client{
-			Timeout:   180 * time.Second,
+			Timeout:   0,
 			Transport: poolTransport,
 			Jar:       jar,
 		}
 	}
+}
+
+// shortHTTPClient 返回短请求专用客户端（总时长兜底）。initHTTPClient 未运行
+// （测试直接调目录拉取）时回落全局客户端，保持旧行为而不是 nil 解引用。
+func shortHTTPClient() *http.Client {
+	if shortClient != nil {
+		return shortClient
+	}
+	return cfg.HttpClient
 }
 
 // boundProxyURL 返回账号稳定绑定的出口代理 URL；未配置代理池时返回空串。
@@ -3318,7 +3385,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // conversationID 为从请求体提取的会话键（可空）：非空时随头族透传 X-Conversation-ID，
 // 让上游按对话聚合。聚合主键 convReqID 在轮转循环外生成一次——同一次用户操作内的
 // 所有尝试（换号重试等）共享同键（issue #35 碎片化修复）。
-func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time, conversationID string) (*http.Response, *Account, *upstreamProfile, bool) {
+func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time, conversationID string, streaming bool) (*http.Response, *Account, *upstreamProfile, bool) {
 	traceID := w.Header().Get("X-Trace-ID")
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
@@ -3328,6 +3395,14 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	if poolSize == 0 {
 		return nil, nil, nil, false
 	}
+	// 每次尝试的 context 取消函数：全部登记，函数退出时统一取消；成功移交的
+	// 那一个从登记表移除（所有权归调用方，由 body 的 Close 负责调用）。
+	var pendingCancels []context.CancelFunc
+	defer func() {
+		for _, c := range pendingCancels {
+			c()
+		}
+	}()
 	// 会话头族聚合主键：轮转循环外生成一次，同一次用户操作内的所有尝试
 	//（换号重试等）共享同键，上游后台按它聚合成一条（issue #35）。
 	convReqID := newMessageID()
@@ -3341,6 +3416,21 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	currentBody := upstreamBytes
 	attempted := make(map[*Account]bool, poolSize)
 	for attempt := 0; attempt < poolSize; attempt++ {
+		// 每次尝试独立的 context：成功时其 cancel 所有权随 body 移交给调用方
+		// （monitorBody 的 Close 负责调用），失败路径由函数级 defer 兜底取消。
+		// 这样上游卡住时可由空闲监控或客户端断连中断，且不会泄漏 context。
+		//
+		// 非流式路径叠加整体超时兜底（客户端等的就是最终结果，没有「持续吐数据」
+		// 的中间态）：用 WithTimeout 直接派生，只登记一个 cancel，避免嵌套导致
+		// 内层 cancel 丢失（WithTimeout 返回的 cancel 同时释放定时器与父 ctx）。
+		var reqCtx context.Context
+		var cancel context.CancelFunc
+		if streaming {
+			reqCtx, cancel = context.WithCancel(r.Context())
+		} else {
+			reqCtx, cancel = context.WithTimeout(r.Context(), upstreamNonStreamTimeout)
+		}
+		pendingCancels = append(pendingCancels, cancel)
 		// 轮转退避（第 2 次尝试起）：换号前先歇一下让上游频控窗口滑过。
 		// 首次尝试不等待（正常单号请求零开销）；ctx 取消（客户端断连/优雅停机）
 		// 立即终止轮转——客户端已走，换号重试无意义。
@@ -3402,7 +3492,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			reqBody = injectPromptCacheKey(currentBody, acc.Auth.Account.UID, conversationID)
 		}
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(reqBody))
+		upstreamReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, prof.chatURL(), bytes.NewReader(reqBody))
 		if err != nil {
 			recordModelFailure(modelName, "req_create_error")
 			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
@@ -3563,6 +3653,11 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 		recordModelSuccess(modelName)
+		// 流中空闲监控：包装 body，静默超阈值即 cancel 本次上游请求。cancel 的
+		// 所有权随 body 移交调用方（其 Close 会调用），因此从登记表移除，避免
+		// 函数级 defer 在 body 读完后重复取消（幂等，但会误伤已移交的语义）。
+		pendingCancels = pendingCancels[:len(pendingCancels)-1]
+		resp.Body = monitorBody(resp.Body, upstreamIdleTimeout, cancel)
 		return resp, acc, prof, true
 	}
 
@@ -3612,6 +3707,20 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 深度思考 (Thinking) 自动适配：混元系列如果未关闭思考，自动赋予 high 档位保证深度思考输出
 	applyThinkingRules(reqObj, modelName)
+
+	// reasoning_effort 档位降级：客户端传的档位模型不支持时（如对只支持到 high 的
+	// 模型传 "max"）上游会 400。降级到 ≤请求档位的最高支持档。档位表来自实时目录
+	// （reasoning.supportedEfforts），未收录的模型一律透传（不猜测）。
+	normalizeReasoningEffort(reqObj, supportedEffortsFor(modelName))
+
+	// DeepSeek 多轮思维链一致性：会话历史里带过 reasoning 痕迹时，上游要求所有
+	// assistant 消息都带 reasoning_content 字段，否则多轮请求被判不一致。
+	// 必须排在 sanitizeMessages 之前——新生成的 reasoning_content 同样要过脱敏。
+	backfillReasoningContent(reqObj)
+
+	// tool_choice 归一化：上游把该字段定义为 string，OpenAI 官方 SDK 默认发对象形式
+	// （{"type":"function",...}），直接透传会 400 code=11101。
+	normalizeToolChoice(reqObj)
 
 	// 系统提示词三模式（prompt-mode）：
 	//   passthrough（缺省）：透传客户端原始 system
@@ -3663,7 +3772,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 	}
 
-	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime, resolveConversationID(reqObj))
+	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime, resolveConversationID(reqObj), isStream)
 	if !ok {
 		return
 	}
@@ -3760,9 +3869,35 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	modelIDs, source := mergedModelIDs()
 	modelsList := make([]map[string]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
-		modelsList = append(modelsList, map[string]any{
+		entry := map[string]any{
 			"id": id, "object": "model", "owned_by": "workbuddy", "permission": []any{},
-		})
+		}
+		// 上下文窗口与输出上限：取实时/npm 目录的上游声明值。两站对同一模型的
+		// 声明可能不同（账号池跨站），此处取首个有值的站点——客户端拿它做本地
+		// 截断预算，保守值优于缺失（缺失会让客户端用默认小窗口白白丢上下文）。
+		// 零值一律省略字段：不编造「假 131072」，让客户端自行决定缺省行为。
+		if m, ok := firstCatalogEntry(id); ok {
+			if m.MaxInputTokens > 0 {
+				entry["context_length"] = m.MaxInputTokens
+			}
+			if m.MaxOutputTokens > 0 {
+				entry["max_output_tokens"] = m.MaxOutputTokens
+			}
+			if m.SupportsImages {
+				entry["supports_images"] = true
+			}
+			if m.SupportsToolCall {
+				entry["supports_tool_call"] = true
+			}
+			// 推理档位：客户端可据此避免盲传非法档位（如对只支持 high 的模型传 max）。
+			if len(m.SupportedEfforts) > 0 {
+				entry["reasoning_supported_efforts"] = m.SupportedEfforts
+				if m.DefaultEffort != "" {
+					entry["reasoning_default_effort"] = m.DefaultEffort
+				}
+			}
+		}
+		modelsList = append(modelsList, entry)
 	}
 	resp := map[string]any{
 		"object": "list",
@@ -3771,6 +3906,47 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Model-Source", modelSourceLabel(source))
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// firstCatalogEntry 按站点顺序取模型目录条目（首个命中）；未收录返回 false。
+// 站点间对同一模型的窗口声明可能不同，此处不合并、不取极值——取声明方原值，
+// 避免把两站的窗口拼成一个上游从未声明的数字。
+func firstCatalogEntry(modelID string) (catalogModel, bool) {
+	for _, site := range catalogSites {
+		if m, ok := modelEntry(site, modelID); ok {
+			return m, true
+		}
+	}
+	return catalogModel{}, false
+}
+
+// supportedEffortsFor 汇总模型在各站点的推理档位（站点间可能不同，取并集）。
+//
+// 并集口径的理由：档位降级只用于「客户端传了上游不认的档位」这一种情形，
+// 而请求最终落到哪个站点由选号决定、此时尚未可知。取并集意味着跨站请求不会被
+// 误降级（某站支持的档位在另一站不支持的极端情形下仍可能 400，但那属于上游
+// 自身不一致，网关不猜测）。未收录任何档位 → 返回 nil，调用方一律透传。
+func supportedEffortsFor(modelID string) map[string][]string {
+	var union []string
+	seen := map[string]bool{}
+	for _, site := range catalogSites {
+		m, ok := modelEntry(site, modelID)
+		if !ok {
+			continue
+		}
+		for _, e := range m.SupportedEfforts {
+			e = strings.TrimSpace(strings.ToLower(e))
+			if e == "" || seen[e] {
+				continue
+			}
+			seen[e] = true
+			union = append(union, e)
+		}
+	}
+	if len(union) == 0 {
+		return nil
+	}
+	return map[string][]string{modelID: union}
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -3800,12 +3976,26 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func applyThinkingRules(obj map[string]any, modelName string) {
 	// 遵循 CodeBuddy 规范：仅当客户端显式设置了 reasoning_effort 时才传递与规范化
-	// 绝不可强行对普通请求注入 reasoning_effort，否则极易触发腾讯内容与安全策略拦截 (code 11128)
-	currEff, exists := obj["reasoning_effort"].(string)
-	if !exists || currEff == "" || currEff == "off" || currEff == "none" {
-		delete(obj, "reasoning_effort")
-		delete(obj, "reasoning_summary")
-		return
+	// 绝不可强行对普通请求注入 reasoning_effort，否则极易触发腾讯内容与安全策略拦截 (code 11-128)
+	//
+	// 双字段兼容：OpenAI 生态同时存在 snake_case（官方 SDK）与 camelCase
+	// （部分 JS 客户端）两种拼写。只认其一会让另一种绕过本函数直抵上游，
+	// 既可能触发上述拦截，也会在关闭思考时留下一个上游不认的字段。
+	for _, key := range []string{"reasoning_effort", "reasoningEffort"} {
+		currEff, exists := obj[key].(string)
+		if !exists {
+			continue
+		}
+		if currEff == "" || strings.EqualFold(strings.TrimSpace(currEff), "off") ||
+			strings.EqualFold(strings.TrimSpace(currEff), "none") {
+			delete(obj, key)
+		}
+	}
+	if _, hasSnake := obj["reasoning_effort"]; !hasSnake {
+		if _, hasCamel := obj["reasoningEffort"]; !hasCamel {
+			delete(obj, "reasoning_summary")
+			return
+		}
 	}
 	// 客户端显式请求思考时，设置 auto
 	obj["reasoning_summary"] = "auto"
@@ -4892,6 +5082,312 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 //  2. 旧版 function_call 空壳：上游在含工具调用的终止片追加
 //     {"function_call":{"name":"","arguments":""}}，属同类非规范噪声，一并清除。
 //  3. delta 中的空值字段（content:""、tool_calls:[] 等）。
+
+// -----------------------------------------------------------------------------
+// 流中空闲监控
+//
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/upstream/idle.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 背景：本仓库对上游只设了整体超时（180s）。若上游建立连接后吐了几个 token 就
+// 静默挂住，该账号的 acc.lock 会一直被占——串行队列全堵，而整体超时要等满才释放。
+// 活跃吐数据续命不掐，静默超过阈值才断流（释放账号锁）。
+// -----------------------------------------------------------------------------
+
+// idleMonitoringBody 包在聊天 SSE body 外层：每次读到底层数据（n>0）就刷新
+// lastRead；后台 goroutine 周期检查，静默超过 idle 就 cancel 请求 context，
+// 中断阻塞中的 Read。
+type idleMonitoringBody struct {
+	rc       io.ReadCloser
+	mu       sync.Mutex
+	lastRead time.Time
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	cancel   context.CancelFunc
+}
+
+func (b *idleMonitoringBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if n > 0 {
+		b.mu.Lock()
+		b.lastRead = time.Now()
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+// Close 停掉后台 goroutine、取消请求 context、关闭底流，保证无泄漏。
+func (b *idleMonitoringBody) Close() error {
+	b.stopOnce.Do(func() { close(b.stopCh) })
+	b.cancel()
+	return b.rc.Close()
+}
+
+func (b *idleMonitoringBody) idleFor() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return time.Since(b.lastRead)
+}
+
+// monitorBody 包装上游 body：每次读到数据续命，静默超过 idle 就 cancel 请求 context
+// 中断阻塞中的 Read。idle<=0 时不启监控 goroutine（禁用空闲掐流），但 Close 仍
+// 负责 cancel——调用方把 cancel 所有权完全交给返回的 body，无需关心分支。
+func monitorBody(rc io.ReadCloser, idle time.Duration, cancel context.CancelFunc) io.ReadCloser {
+	b := &idleMonitoringBody{
+		rc:       rc,
+		lastRead: time.Now(),
+		stopCh:   make(chan struct{}),
+		cancel:   cancel,
+	}
+	if idle <= 0 {
+		return b
+	}
+	go func() {
+		t := time.NewTicker(idleTick(idle))
+		defer t.Stop()
+		for {
+			select {
+			case <-b.stopCh:
+				return
+			case <-t.C:
+				if b.idleFor() > idle {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return b
+}
+
+// idleTick 返回监控周期：idle/4，钳在 [10ms, 1s]。小 idle 也能快速发现，大值避免空转。
+func idleTick(idle time.Duration) time.Duration {
+	d := idle / 4
+	if d > time.Second {
+		d = time.Second
+	}
+	if d < 10*time.Millisecond {
+		d = 10 * time.Millisecond
+	}
+	return d
+}
+
+// -----------------------------------------------------------------------------
+// reasoning_effort 档位降级
+//
+// 来源：移植自 Sliverkiss/workbuddy2api 的 internal/upstream/payload.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 背景：客户端可能传模型不支持的档位（如对只支持到 high 的模型传 "max"），
+// 上游会 400。降级到 ≤请求档位的最高支持档，语义偏离最小。
+// -----------------------------------------------------------------------------
+
+// effortRank 档位从低到高。
+var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+
+// normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
+//   - 请求档位模型支持 → 原样透传
+//   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
+//   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
+//   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
+func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
+	if len(efforts) == 0 {
+		return
+	}
+	model, _ := obj["model"].(string)
+	if model == "" {
+		return
+	}
+	supported, ok := efforts[model]
+	if !ok || len(supported) == 0 {
+		return
+	}
+	key := ""
+	if _, present := obj["reasoning_effort"]; present {
+		key = "reasoning_effort"
+	} else if _, present := obj["reasoningEffort"]; present {
+		key = "reasoningEffort"
+	} else {
+		return
+	}
+	reqStr, ok := obj[key].(string)
+	if !ok {
+		return
+	}
+	reqStr = strings.TrimSpace(strings.ToLower(reqStr))
+	reqIdx, known := effortRank[reqStr]
+	if !known {
+		return
+	}
+	// 已知档位：先把值归一化写回。客户端可能带空白/大小写变体（"  HIGH  "），
+	// 上游按字面比较会判非法参数；归一化后的值才是档位表里的规范形式。
+	if orig, ok := obj[key].(string); ok && orig != reqStr {
+		obj[key] = reqStr
+	}
+	// off/none 的语义是「关闭思考」，rank 为 0（最低）。模型不支持该档位时
+	// **不得上抬**到任何开启档位——那会把客户端明确的关闭意图反转成开启，
+	// 比透传一个上游可能拒绝的值更糟。原值透传，由上游判定。
+	if reqIdx == 0 {
+		return
+	}
+	// 在 ≤请求档位的支持档里选最高档；命中且与请求不同才改写。
+	best, bestIdx := "", -1
+	for _, s := range supported {
+		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
+		if k && idx <= reqIdx && idx > bestIdx {
+			best, bestIdx = s, idx
+		}
+	}
+	if best != "" {
+		if obj[key] != best {
+			obj[key] = best
+			log.Printf("[Effort] reasoning_effort 降级 model=%s %s -> %s", model, reqStr, best)
+		}
+		return
+	}
+	// 支持档全部高于请求档：取最低支持档。
+	lowest, lowestIdx := "", 1<<30
+	for _, s := range supported {
+		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
+		if k && idx < lowestIdx {
+			lowest, lowestIdx = s, idx
+		}
+	}
+	if lowest != "" {
+		obj[key] = lowest
+		log.Printf("[Effort] reasoning_effort 上抬 model=%s %s -> %s", model, reqStr, lowest)
+	}
+}
+
+// isDeepSeekModel 模型名以 deepseek 为前缀（不区分大小写）。
+// 覆盖 deepseek-v4.1-flash / deepseek-v4-pro / deepseek-r1 等变体；
+// 前缀匹配对齐官方 thinkingFormat:"deepseek" 的判定口径，避免漏注。
+func isDeepSeekModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
+}
+
+// backfillReasoningContent DeepSeek 多轮一致性：历史 assistant 消息带 reasoning 痕迹时，
+// 上游要求后续请求所有 assistant 消息都带 reasoning_content 字段（string，可为空串）
+// ——即 requiresReasoningContentOnAssistantMessages（官方客户端 matches 规则）。
+//
+// 来源：逐字移植自 Sliverkiss/workbuddy2api 的 internal/upstream/thinking.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 规则（对齐官方客户端逻辑）：
+//   - 会话内任一 assistant 消息带非空 reasoning（string）或已有 reasoning_content 字段
+//     → 所有 assistant 消息确保有 reasoning_content（string）：
+//   - reasoning 非空且无 reasoning_content → 复制 reasoning 值
+//   - 已有 reasoning_content → 原样保留（不覆盖）
+//   - 两者皆无 → 补空串 ""
+//   - 任何 assistant 均无 reasoning 痕迹 → 零改动（不白白加字段）
+//
+// 仅 deepseek 模型生效（thinkingFormat:deepseek + requiresReasoningContent）。
+func backfillReasoningContent(obj map[string]any) {
+	model, _ := obj["model"].(string)
+	if !isDeepSeekModel(model) {
+		return
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return
+	}
+	// 第一遍：检测是否有任何 reasoning 痕迹（非空 reasoning 或已有 reasoning_content）。
+	hasTrace := false
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
+			continue
+		}
+		if r, ok := msg["reasoning"].(string); ok && r != "" {
+			hasTrace = true
+			break
+		}
+		if _, ok := msg["reasoning_content"]; ok {
+			hasTrace = true
+			break
+		}
+	}
+	if !hasTrace {
+		return
+	}
+	// 第二遍：所有 assistant 消息补/复制 reasoning_content 字段。
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		if _, ok := msg["reasoning_content"]; ok {
+			continue // 已有 → 不覆盖
+		}
+		if r, ok := msg["reasoning"].(string); ok {
+			msg["reasoning_content"] = r
+		} else {
+			msg["reasoning_content"] = ""
+		}
+	}
+}
+
+// normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
+//
+// 来源：逐字移植自 Sliverkiss/workbuddy2api 的 internal/upstream/payload.go
+// （MIT License, Copyright (c) 2026 Sliverkiss）。
+//
+// 背景：上游把 tool_choice 定义为 string，而 OpenAI 官方 SDK 默认发对象形式
+// （{"type":"function","function":{"name":"x"}}），直接透传会 400 code=11101。
+//
+//   - "none"            → 删 tool_choice + 删 tools/functions
+//   - {"type":"none"}   → 同上
+//   - {"type":"auto"/"required"} → 字符串 "auto"/"required"
+//   - {"type":"function","function":{"name":"x"}} → 字符串 "x"
+//   - 其他对象/非标量 → 删 tool_choice
+func normalizeToolChoice(obj map[string]any) {
+	suppress := func() {
+		delete(obj, "tools")
+		delete(obj, "functions")
+	}
+	tc, present := obj["tool_choice"]
+	if !present {
+		return
+	}
+	switch v := tc.(type) {
+	case string:
+		if strings.EqualFold(strings.TrimSpace(v), "none") {
+			delete(obj, "tool_choice")
+			suppress()
+		}
+	case map[string]any:
+		typ, _ := v["type"].(string)
+		typ = strings.ToLower(strings.TrimSpace(typ))
+		switch typ {
+		case "none":
+			delete(obj, "tool_choice")
+			suppress()
+		case "auto", "required":
+			obj["tool_choice"] = typ
+		case "function":
+			name := ""
+			if fn, ok := v["function"].(map[string]any); ok {
+				name, _ = fn["name"].(string)
+			}
+			if name == "" {
+				name, _ = v["name"].(string)
+			}
+			if name = strings.TrimSpace(name); name != "" {
+				obj["tool_choice"] = name
+			} else {
+				obj["tool_choice"] = "auto"
+			}
+		default:
+			delete(obj, "tool_choice")
+		}
+	default:
+		delete(obj, "tool_choice")
+	}
+}
 
 // stripToolCallNames 收敛流式 tool_calls 的 name 语义为「每个 index 只出现一次」：
 // 首片保留 function.name，同一 index 后续分片里的 name 键一律删除（无论上游是

@@ -81,7 +81,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[#%d] POST /v1/responses -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 
-	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime, resolveConversationID(chatReq))
+	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime, resolveConversationID(chatReq), isStream)
 	if !ok {
 		return
 	}

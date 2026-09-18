@@ -85,6 +85,15 @@ type catalogModel struct {
 	FromLive        bool    `json:"fromLive,omitempty"`     // 是否来自实时接口
 	MaxInputTokens  int     `json:"maxInputTokens,omitempty"`
 	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
+
+	// 能力旗标与推理档位：实时目录与 npm 静态目录同构下发，供 /v1/models 透出
+	// （客户端可发现上下文窗口与档位，不再盲传非法值）与请求体档位降级。
+	// 零值 = 上游未声明（与「显式 false/空」同形），透出时按「未声明即省略」处理。
+	SupportsImages   bool     `json:"supportsImages,omitempty"`
+	SupportsReason   bool     `json:"supportsReasoning,omitempty"`
+	SupportsToolCall bool     `json:"supportsToolCall,omitempty"`
+	SupportedEfforts []string `json:"supportedEfforts,omitempty"`
+	DefaultEffort    string   `json:"defaultEffort,omitempty"`
 }
 
 // modelPriceProbe 是某站点某模型的价格探测状态。
@@ -163,6 +172,15 @@ type liveCatalogData struct {
 		Credits         any    `json:"credits"`
 		MaxInputTokens  int    `json:"maxInputTokens"`
 		MaxOutputTokens int    `json:"maxOutputTokens"`
+		SupportsImages  bool   `json:"supportsImages"`
+		SupportsReason  bool   `json:"supportsReasoning"`
+		SupportsTool    bool   `json:"supportsToolCall"`
+		Reasoning       struct {
+			Effort           string   `json:"effort"`
+			Summary          string   `json:"summary"`
+			DefaultEffort    string   `json:"defaultEffort"`
+			SupportedEfforts []string `json:"supportedEfforts"`
+		} `json:"reasoning"`
 	} `json:"models"`
 	ModelPromotions []livePromotion `json:"modelPromotions"`
 }
@@ -291,6 +309,10 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 		entry := catalogModel{
 			ID: id, Name: strings.TrimSpace(m.Name), FromLive: true,
 			MaxInputTokens: m.MaxInputTokens, MaxOutputTokens: m.MaxOutputTokens,
+			SupportsImages: m.SupportsImages, SupportsReason: m.SupportsReason,
+			SupportsToolCall: m.SupportsTool,
+			SupportedEfforts: m.Reasoning.SupportedEfforts,
+			DefaultEffort:    m.Reasoning.DefaultEffort,
 		}
 		if s, ok := m.Credits.(string); ok {
 			entry.Credits = strings.TrimSpace(s)
@@ -330,7 +352,7 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 func fetchNPMCatalogVersion() (string, error) {
 	var lastErr error
 	for _, base := range npmBases {
-		resp, err := cfg.HttpClient.Get(base + "/latest")
+		resp, err := shortHTTPClient().Get(base + "/latest")
 		if err != nil {
 			lastErr = err
 			continue
@@ -356,9 +378,13 @@ func fetchNPMCatalogVersion() (string, error) {
 func parseNPMCatalog(data []byte) ([]catalogModel, error) {
 	var doc struct {
 		Models *[]struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			Credits any    `json:"credits"`
+			ID              string `json:"id"`
+			Name            string `json:"name"`
+			Credits         any    `json:"credits"`
+			MaxInputTokens  int    `json:"maxInputTokens"`
+			MaxOutputTokens int    `json:"maxOutputTokens"`
+			SupportsImages  bool   `json:"supportsImages"`
+			SupportsTool    bool   `json:"supportsToolCall"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
@@ -375,7 +401,13 @@ func parseNPMCatalog(data []byte) ([]catalogModel, error) {
 			continue
 		}
 		seen[id] = true
-		entry := catalogModel{ID: id, Name: strings.TrimSpace(m.Name)}
+		// 能力字段（上下文窗口/输出上限/多模态/工具调用）与实时目录同构下发，
+		// 实时接口不可用时这些是唯一的窗口来源——丢弃会让 /v1/models 缺字段。
+		entry := catalogModel{
+			ID: id, Name: strings.TrimSpace(m.Name),
+			MaxInputTokens: m.MaxInputTokens, MaxOutputTokens: m.MaxOutputTokens,
+			SupportsImages: m.SupportsImages, SupportsToolCall: m.SupportsTool,
+		}
 		if s, ok := m.Credits.(string); ok {
 			entry.Credits = strings.TrimSpace(s)
 		}
@@ -412,7 +444,7 @@ func fetchNPMCatalog(version, file string) ([]catalogModel, string, error) {
 }
 
 func fetchNPMCatalogJSON(url string) ([]catalogModel, error) {
-	resp, err := cfg.HttpClient.Get(url)
+	resp, err := shortHTTPClient().Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -459,7 +491,7 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 }
 
 func fetchNPMCatalogTarball(url, file string) ([]catalogModel, error) {
-	resp, err := cfg.HttpClient.Get(url)
+	resp, err := shortHTTPClient().Get(url)
 	if err != nil {
 		return nil, err
 	}
