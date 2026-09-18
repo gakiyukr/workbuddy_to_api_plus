@@ -46,7 +46,7 @@
 | `8d7e1d8` | tool 配对自愈（孤儿清理 + 结果块重排） | 移植 wb2api 的 `tool_pairing.go`（MIT） |
 | `0dcefa0` | 残缺工具参数检测 + 轮转退避与抖动 | 移植 wb2api 的 `truncation.go` / `backoff.go`（MIT） |
 | `aefbc39` | 流式工具名收敛 + 别名翻译 + `gateway_hint` | 移植 wb2api 的 `sse.go` / `payload.go` / `hint.go`（MIT） |
-| 待提交 | `tool_choice` 归一化 + 档位降级 + 思维链回填 + 空闲掐流 + `/v1/models` 能力透出 | 移植 wb2api 的 `payload.go` / `thinking.go` / `idle.go` / 目录能力字段（MIT） |
+| `0d18103` | `tool_choice` 归一化 + 档位降级 + 思维链回填 + 空闲掐流 + `/v1/models` 能力透出 | 移植 wb2api 的 `payload.go` / `thinking.go` / `idle.go` / 目录能力字段（MIT） |
 
 设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
 
