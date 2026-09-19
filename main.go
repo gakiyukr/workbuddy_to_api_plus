@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.0"
+	version = "1.14.1"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -209,6 +209,7 @@ type Config struct {
 	ProbeLimit          int           // probe 专用：未显式指定模型时的取用数量
 	CostExploreInterval time.Duration // costTier 条件探索窗口（默认 30m，0 关停）：免费层垄断 + 存在未知层账号时，按窗口把一次选号改道给未知号搭车学习
 	ProxyURLs           []string      // 多代理池（-proxies，逗号分隔）：账号按凭据文件名稳定绑定到其中一个出口 IP
+	ExtraModels         []string      // 额外模型 ID（-extra-models，逗号分隔）：上游可请求但目录未收录的模型，透出到 /v1/models 供客户端发现
 	HttpClient          *http.Client
 }
 
@@ -404,6 +405,7 @@ func main() {
 		args = os.Args[2:]
 	}
 
+	extraModelsList := ""
 	proxyList := ""
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
 	fs.StringVar(&cfg.Addr, "addr", "127.0.0.1", "网关监听地址")
@@ -424,8 +426,8 @@ func main() {
 	fs.StringVar(&cfg.PromptText, "prompt-text", "", "custom/append 模式的网关系统提示词文本，空 = 内置中性提示词")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未显式指定模型时探测的模型数量上限")
-	fs.DurationVar(&cfg.CostExploreInterval, "cost-explore-interval", modelCostExploreDefault, "costTier 条件探索窗口：免费层垄断时按窗口改道一次给未知账号搭车学习（0 关停）")
 	fs.StringVar(&proxyList, "proxies", "", "多代理池（逗号分隔）：账号按凭据文件名稳定绑定到其中一个出口 IP")
+	fs.StringVar(&extraModelsList, "extra-models", "", "额外模型 ID（逗号分隔）：上游可请求但官方目录未收录的模型，透出到 /v1/models 供客户端发现（去重、大小写归一）")
 	_ = fs.Parse(args)
 
 	// -proxies 逗号分隔解析：去空白、忽略空项。
@@ -434,7 +436,8 @@ func main() {
 			cfg.ProxyURLs = append(cfg.ProxyURLs, p)
 		}
 	}
-
+	// -extra-models 逗号分隔解析。
+	cfg.ExtraModels = parseExtraModels(extraModelsList)
 	// 若未指定 -auth 且未指定 -auth-dir，则自动扫描当前目录下所有 workbuddy*.json 组成账号池，
 	// 这样把多个凭据文件放进工作目录即可自动多账号，无需手写参数。
 	fs.Visit(func(f *flag.Flag) {
@@ -1055,6 +1058,29 @@ func accountReloaderLoop() {
 
 func normalizeModelName(model string) string {
 	return strings.ToLower(strings.TrimSpace(model))
+}
+
+// parseExtraModels 解析 -extra-models 的逗号分隔列表：去空白、忽略空项、
+// 大小写归一（normalizeModelName，与目录键同口径），保持首次出现顺序并去重。
+func parseExtraModels(raw string) []string {
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		p = normalizeModelName(p)
+		dup := false
+		for _, existing := range out {
+			if existing == p {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func modelStateLocked(acc *Account, model string) *modelRuntimeState {

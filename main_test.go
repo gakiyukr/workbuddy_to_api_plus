@@ -700,6 +700,121 @@ func TestErrKindDispatchSemantics(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// -extra-models 测试
+// -----------------------------------------------------------------------------
+
+// 验证 -extra-models 解析：trim、忽略空项、大小写归一（与目录键同口径）、
+// 保持首次出现顺序并去重。
+func TestParseExtraModels(t *testing.T) {
+	got := parseExtraModels(" DeepSeek-V4.1-Flash , b ,, A ,DeepSeek-v4.1-flash")
+	want := []string{"deepseek-v4.1-flash", "b", "a"}
+	if len(got) != len(want) {
+		t.Fatalf("解析结果 = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("解析结果[%d] = %q, want %q（完整: %#v）", i, got[i], want[i], got)
+		}
+	}
+	// 空串 / 纯空白 → nil
+	if got := parseExtraModels(""); got != nil {
+		t.Fatalf("空串应返回 nil，实际 %#v", got)
+	}
+	if got := parseExtraModels(" , ,, "); got != nil {
+		t.Fatalf("纯空白应返回 nil，实际 %#v", got)
+	}
+}
+
+// 验证 mergedModelIDs 追加额外模型：与目录重复的跳过，新增的追加在尾部。
+func TestMergedModelIDsWithExtra(t *testing.T) {
+	modelsMu.Lock()
+	oldCatalog := catalogModels
+	catalogModels = map[string][]catalogModel{
+		"cn":   {{ID: "cat-a"}, {ID: "cat-b"}},
+		"intl": {{ID: "intl-c"}},
+	}
+	modelsMu.Unlock()
+	oldExtra := cfg.ExtraModels
+	cfg.ExtraModels = []string{"deepseek-v4.1-flash", "cat-a"}
+	defer func() {
+		modelsMu.Lock()
+		catalogModels = oldCatalog
+		modelsMu.Unlock()
+		cfg.ExtraModels = oldExtra
+	}()
+
+	ids, _ := mergedModelIDs()
+	got := map[string]bool{}
+	for _, id := range ids {
+		if got[id] {
+			t.Fatalf("模型 %q 重复出现: %#v", id, ids)
+		}
+		got[id] = true
+	}
+	for _, want := range []string{"cat-a", "cat-b", "intl-c", "deepseek-v4.1-flash"} {
+		if !got[want] {
+			t.Errorf("缺少模型 %q: %#v", want, ids)
+		}
+	}
+}
+
+// 验证 /v1/models 透出额外模型：以裸条目出现（无目录条目 → 能力字段按既有
+// 纪律省略，不编造），且与目录条目去重。
+func TestHandleModelsIncludesExtraModels(t *testing.T) {
+	chdirTemp(t)
+	modelsMu.Lock()
+	oldCatalog := catalogModels
+	catalogModels = map[string][]catalogModel{
+		"cn": {{ID: "cat-a", MaxInputTokens: 200000}},
+	}
+	modelsMu.Unlock()
+	oldExtra := cfg.ExtraModels
+	cfg.ExtraModels = []string{"deepseek-v4.1-flash", "cat-a"}
+	defer func() {
+		modelsMu.Lock()
+		catalogModels = oldCatalog
+		modelsMu.Unlock()
+		cfg.ExtraModels = oldExtra
+	}()
+
+	rec := httptest.NewRecorder()
+	handleModels(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	byID := map[string]map[string]any{}
+	for _, m := range resp.Data {
+		id := m["id"].(string)
+		counts[id]++
+		byID[id] = m
+	}
+	if counts["cat-a"] != 1 {
+		t.Fatalf("目录模型 cat-a 应恰好出现 1 次，实际 %d", counts["cat-a"])
+	}
+	if counts["deepseek-v4.1-flash"] != 1 {
+		t.Fatalf("额外模型应恰好出现 1 次，实际 %d", counts["deepseek-v4.1-flash"])
+	}
+	extra := byID["deepseek-v4.1-flash"]
+	if extra == nil {
+		t.Fatal("额外模型缺失")
+	}
+	for _, k := range []string{"context_length", "max_output_tokens", "supports_images", "reasoning_supported_efforts"} {
+		if _, ok := extra[k]; ok {
+			t.Errorf("额外模型不应编造能力字段 %s: %#v", k, extra[k])
+		}
+	}
+	if extra["object"] != "model" {
+		t.Errorf("额外模型应保留基础字段: %#v", extra)
+	}
+}
+
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
 // 轮转耗尽兜底测试
 // -----------------------------------------------------------------------------
 

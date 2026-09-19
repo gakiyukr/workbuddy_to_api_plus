@@ -48,6 +48,7 @@
 | `aefbc39` | 流式工具名收敛 + 别名翻译 + `gateway_hint` | 移植 wb2api 的 `sse.go` / `payload.go` / `hint.go`（MIT） |
 | `0d18103` | `tool_choice` 归一化 + 档位降级 + 思维链回填 + 空闲掐流 + `/v1/models` 能力透出 | 移植 wb2api 的 `payload.go` / `thinking.go` / `idle.go` / 目录能力字段（MIT） |
 | `89781ca` | 修正超时分层：共享客户端默认安全、聊天路径显式 opt-out | 自研（修正 `0d18103` 引入的回归） |
+| `546ca41` | 轮转耗尽兜底透传真实上游错误（`11102`/`11129` 不再被 429 掩盖）；`11129` 归入 errBadParams | 自研（修复基线既有缺陷） |
 
 设计取舍记录在 [`FORK-PLAN.md`](FORK-PLAN.md)，其中包含 wb2api 的实测数据（卸载前日志累计 WAF 命中 680 次）与本仓库的抗 WAF 架构依据。
 
@@ -260,6 +261,7 @@ workbuddy-gateway [command] [options]
 | `-models-refresh <min>` | `60` | 模型目录刷新间隔，`0` 关闭 |
 | `-cost-explore-interval <dur>` | `30m` | costTier 条件探索窗口，`0` 关停 |
 | `-proxies <url1,url2,...>` | 空 | 多代理池：账号按凭据文件名稳定绑定到其中一个出口 IP |
+| `-extra-models <id1,id2,...>` | 空 | 额外模型 ID：上游可请求但官方目录未收录的模型，透出到 `/v1/models` 供客户端发现（去重、大小写归一） |
 
 ---
 
@@ -291,6 +293,9 @@ workbuddy-gateway serve -models-refresh 0
 
 # 多代理池：账号按文件名稳定散列到多个出口 IP
 workbuddy-gateway serve -proxies http://127.0.0.1:7890,socks5://127.0.0.1:1080
+
+# 补充官方目录未收录但上游可用的模型（让客户端可发现）
+workbuddy-gateway serve -extra-models deepseek-v4.1-flash
 
 # 关停成本条件探索（回到纯成本分层行为）
 workbuddy-gateway serve -cost-explore-interval 0
@@ -848,8 +853,8 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o d
 ```bash
 # 1. bump main.go 中的 version 常量
 # 2. 提交后打 tag 并推送
-git commit -am "chore: bump version to 1.14.0"
-git tag -a v1.14.0 -m "WorkBuddy Local Gateway v1.14.0"
+git commit -am "chore: bump version to 1.14.1"
+git tag -a v1.14.1 -m "WorkBuddy Local Gateway v1.14.1"
 git push origin main --follow-tags
 ```
 

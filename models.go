@@ -615,6 +615,14 @@ func catalogSnapshot() (map[string][]catalogModel, string) {
 	return out, dynamicSource
 }
 
+// mergedModelIDs 汇总 /v1/models 与 /health 的模型列表：两站目录（实时 + npm）
+// 按站点顺序合并去重，再追加 -extra-models 配置的额外模型（同样去重）。
+//
+// 额外模型的动机：上游存在「可请求但官方目录未收录」的模型（生产实测
+// deepseek-v4.1-flash 承载了全部流量却不列在目录里）。调度层完全透传 model
+// 字段、不受目录限制，这类模型本来就可用；缺的只是客户端的模型发现——补进
+// 列表即可。额外模型没有目录条目（无窗口/能力/档位声明），按「未声明即省略」
+// 的既有纪律以裸条目透出，不编造能力字段。
 func mergedModelIDs() ([]string, string) {
 	catalogs, source := catalogSnapshot()
 	seen := map[string]bool{}
@@ -626,6 +634,13 @@ func mergedModelIDs() ([]string, string) {
 				ids = append(ids, m.ID)
 			}
 		}
+	}
+	for _, extra := range cfg.ExtraModels {
+		if extra == "" || seen[extra] {
+			continue
+		}
+		seen[extra] = true
+		ids = append(ids, extra)
 	}
 	return ids, source
 }
