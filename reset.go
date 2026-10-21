@@ -10,8 +10,9 @@ import (
 // -----------------------------------------------------------------------------
 // reset 命令
 //
-// 清空除登录凭据（workbuddy*.json）以外的全部本地数据：
+// 清空除登录凭据（workbuddy*.json）与 config.json 以外的全部本地数据：
 //   - 状态快照 workbuddy-status.json
+//   - 用量统计 stats.json
 //   - 模型缓存 wb-models-cache.json（含倍率与价格探测结论）
 //   - 失效标记 *.disabled / *.json.disabled
 //   - 运行日志 logs/
@@ -39,6 +40,7 @@ func runReset() {
 	// 1. 状态快照与模型缓存（含临时文件）
 	for _, f := range []string{
 		statusSnapshotFile, statusSnapshotFile + ".tmp",
+		statsFile, statsFile + ".tmp",
 		modelsCacheFile, modelsCacheFile + ".tmp",
 	} {
 		removeIfExists(f, "")

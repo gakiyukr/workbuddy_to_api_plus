@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     WorkBuddy Local Gateway 一键交叉编译（纯 Go、零 CGO）。
 .DESCRIPTION

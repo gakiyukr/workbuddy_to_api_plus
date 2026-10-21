@@ -170,8 +170,10 @@
 
 - [代码来源与许可](#代码来源与许可)
 - [核心特性](#核心特性)
+- [上游 v1.14.21 合并功能](#上游-v11421-合并功能)
 - [命令总览](#命令总览)
 - [serve](#serve)
+- [Web 控制台](#web-控制台)
 - [login](#login)
 - [status](#status)
 - [refresh](#refresh)
@@ -194,9 +196,9 @@
 > 标注 ✦ 的条目为本仓库二次开发新增，其余为基线（CangShui/workbuddy-gateway）既有能力。
 
 - **国内 / 国际双站反代**：两个站点走同一套协议，凭据通过 `edition` 字段区分，刷新与对话自动路由到各自上游。
-- **模型完全透传**：客户端传什么 `model` 就原样中继到上游，无白名单限制。`/v1/models` 仅用于客户端自动补全，不影响实际转发。
+- **模型完全透传**：客户端传什么 `model` 就原样中继到上游；唯一例外是 `config.json` 的模型黑/白名单（禁用模型在网关侧直接 403，不调用上游）。`/v1/models` 仅用于客户端自动补全，不影响实际转发。
 - **模型列表双来源合并**：实时接口 + npm 静态目录，按 ID 去重、接口优先；失败用本地缓存，两边都失败且无缓存时该站点本轮不展示模型（不影响调用）。
-- **模型倍率与价格探测**：促销生效时展示 `credits` × factor；促销过期或接口无有效倍率时由余额未耗尽的同站点账号实测（启动即探测、重置后立即探测、每模型 12 小时一轮）。
+- **模型倍率与价格探测**：促销生效时展示 `credits` × factor；促销过期或接口无有效倍率时，可由余额未耗尽的同站点账号实测。**后台自动探测默认关闭**，仅显式传入 `-allow-price-probes` 才开启；正常客户端请求仍会从 `usage.credit` 学习免费/收费状态，不消耗额外探测请求。
 - **多账号池 + 轮询负载均衡**：`-auth` 逗号分隔或 `-auth-dir` 目录，请求按 round-robin 分发；国内站与国际站账号可混挂。
 - **模型级隔离**：`6004` 只冷却触发它的账号 + 模型，`14018` 只阻断该账号的当前收费模型，不再因为一个模型拖垮整个账号。
 - **免费站点优先**：同一模型若「一个站点免费、另一个站点收费」，优先使用免费站点账号直至其受限；两个站点都收费（仅倍率不同）时不做倾斜，正常轮询。
@@ -204,7 +206,7 @@
 - ✦ **错误分类体系**：13 个 `errKind`（12 个实际分类 + `errNone` 兜底）区分「账号的问题」与「请求的问题」——前者冷却 / 禁用该账号并换号重试，后者不罚账号直接透传，避免把请求级错误记到账号头上。（移植 wb2api 的 `ErrKind`）
 - ✦ **WAF 拦截识别**：403 且响应体无业务信封（无 `code` / `msg` 字段）判定为 WAF 拦截形态，仅软冷却 60 秒、**不删除凭据**；带业务信封的 403 才走授权失效判定。（修复基线误删凭据缺陷）
 - ✦ **指纹脱敏**：出站请求体清洗上游内容审核拒绝的字面量（Claude Code / Codex 模板句、Anthropic 计费头键值对、`11-128` 字面量），改写单字破坏精确匹配而保留语义；覆盖 `content` / `reasoning_content` / `tool_calls.arguments` 三个字段。（基线实现恒为 no-op，本仓库修复）
-- ✦ **会话头族**：同一次用户操作内的所有上游尝试复用同一聚合主键（`X-Conversation-Request-ID` / `X-Root-Request-ID`），每次尝试独立的 message 级 ID，上游后台按对话轮聚合而非碎片化记录；附带 B3 trace 三元组。（移植 wb2api 思路）
+- ✦ **官方会话头族**：出站恒发 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`，语义对齐官方 WorkBuddy 5.8.4 客户端；同一次逻辑请求的换号/重试复用同一组标识，修复国际站与工具请求的 `11128 conversation id missing`。会话键支持入站头、`X-Session-ID` 与 body/metadata 字段，非 UUID 会话键按调用方隔离生成稳定 UUIDv5。（替换早期 wb2api 的 B3/Root 头方案）
 - ✦ **内容拦截降级重试**：passthrough / append 模式下首遇内容拦截时，切换到中性系统提示词（直至次日 CST 00:00）同请求重试一次，破解模板句指纹误报；custom 模式已是网关提示词，不进入降级。
 - **成本账本与分层选号**：每次成功请求按 `usage.credit` 折算每千 token 单价（EMA α=0.3 平滑、6 小时过期）记入「账号 + 模型」账本；选号时按 **免费 > 未知 > 收费** 硬过滤分层，收费层内单价低者优先，避免把流量浪费在贵号上。
 - ✦ **成本条件探索（反垄断）**：免费层账号垄断某模型时，未知层账号永远轮不到、也就永远学不到属性。默认每 30 分钟（`-cost-explore-interval`，0 关停）把**一次真实用户请求**改道给未知账号搭车学习——零新增上游调用，学成即毕业；探索失败自动回退，不影响本次请求。（移植 wb2api issue #136 方案 a′）
@@ -219,30 +221,107 @@
 - ✦ **`tool_choice` 归一化**：上游把该字段定义为 **string**，而 OpenAI 官方 SDK 默认发对象形式（`{"type":"function","function":{"name":"x"}}`），直接透传会 400（`11101`）——用官方 SDK 的客户端此前全部失败。网关按上游类型改写：`function` 对象取 name 转字符串、`auto`/`required` 对象转对应字符串、`none` 删字段并抑制 `tools`/`functions`、无法识别一律删字段。（移植 wb2api 的 `normalizeToolChoice`）
 - ✦ **推理档位降级**：客户端传的档位模型不支持时（如对只支持到 `high` 的模型传 `max`）上游会 400。网关按上游实时目录下发的 `reasoning.supportedEfforts` 降到 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档（偏离最小）。**`off`/`none` 绝不上抬**——那会把客户端明确的「关闭思考」反转成开启，比透传更糟。未收录档位的模型一律透传（不猜测），snake/camel 双字段兼容。（移植 wb2api 的 `normalizeReasoningEffort`）
 - ✦ **DeepSeek 思维链回填**：多轮会话中历史 assistant 消息带过 `reasoning` 痕迹时，上游要求**所有** assistant 消息都带 `reasoning_content` 字段（可为空串），否则判会话不一致。网关检测到痕迹后为缺失者回填（有 `reasoning` 的复制、没有的补空串），已有值不覆盖；无痕迹时零改动（不白白加字段）。仅 deepseek 系模型生效。（移植 wb2api 的 `backfillReasoningContent`）
-- ✦ **流中空闲掐流**：上游建连并开始吐数据后中途静默挂住时，此前只能干等到整体超时——该连接与账号槽位一直被占。网关包装上游 body，活跃吐数据续命、静默超阈值（300s）即取消请求中断阻塞读。超时按**调用性质**分成两档，默认安全：**共享客户端带总时长**（180s，覆盖凭据刷新 / 额度查询 / 签到 / 模型目录 / 价格探测——这些没有流中续命语义，挂死必须被兜底），**聊天客户端无总时长**（长思考/长输出会被总时长硬切断，且切断点与上游行为无关；改由 `ResponseHeaderTimeout` 120s 管首字节前换号、空闲监控 300s 管流中静默）。非流式聊天另有 360s ctx 总时长。（移植 wb2api 的 `idle.go` 与超时分层思路）
+- ✦ **超时分层与流中空闲掐流**：客户端本身不设总时长，避免长思考/长输出被硬切断。上游请求由三层约束：`ResponseHeaderTimeout`（默认 5 分钟，首字节前换号）、流中空闲看门狗（默认 2 分钟无数据即中断并释放账号锁）与瞬时网络错误重试（默认 2 次）。控制类请求（刷新/额度/签到/目录/探测）另有 60 秒 ctx 兜底；`config.json` 的 `upstream` 段可热更新这些阈值。非流式请求在本地聚合上游 SSE，不再额外设置总时长。
 - ✦ **`/v1/models` 能力透出**：模型条目附带上游声明的 `context_length` / `max_output_tokens` / `supports_images` / `supports_tool_call` / `reasoning_supported_efforts` / `reasoning_default_effort`，客户端可据此自动配置上下文预算与推理档位（不再盲传非法档位）。零值一律**省略字段**——不编造「假 131072」误导客户端提前截断、白白丢上下文。同时补上 npm 静态目录解析丢弃这些字段的缺陷（实时接口不可用时它是唯一来源）。（移植 wb2api 的 `context_catalog` / `effort_catalog` 思路）
 - **国内站每日自动签到**：服务启动、凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；国际站跳过。
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
-- **授权失效自动禁用**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复；**WAF 形态的 403 不在此列**。
-- **后台自动续期**：每 5 分钟检查 Token，距过期不足 15 分钟自动刷新并写回凭据文件。
-- **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免 Anthropic 翻译层误判 `stop_reason` 导致工具不执行。
+- **授权失效安全处理**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，先停止调度并写失效标记；删除凭据前还会做一次只读校验，确认凭据确实不可用才删除，网络/5xx/普通 403 无法判定时保守保留。**WAF 形态的 403 只软冷却，不删凭据**。
+- **后台自动续期 + 主动保活**：每 5 分钟检查 Token，距过期不足 15 分钟自动刷新；另可用 `-keepalive-hours`（默认每天 22:00）在固定时刻主动刷新全部账号，避免长期空闲账号静默失效。连续刷新失败达到阈值才判定登录态失效。
+- **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免 Anthropic 翻译层误判 `stop_reason` 导致工具不执行；流正常关闭但没有 `finish_reason` 时拒绝伪造 `[DONE]`，向客户端下发明确的中断错误。
 - **OpenAI 兼容协议**：`/v1/chat/completions`（SSE 流式 + 非流式聚合）、`/v1/responses`（Responses API）、`/v1/models`、`/health`。
+- **Anthropic Messages API**：`/v1/messages`（流式 + 非流式聚合）与 `/v1/messages/count_tokens`，鉴权兼容 `x-api-key`，Claude Code 等 Anthropic 客户端无需外部翻译层。
+- **Web 控制台（可选）**：`-webui` 启用独立管理端口（默认 8316），提供总览、账号、模型、日志、配置与凭据（脱敏）管理；管理 Key 与模型 API Key 相互独立，均由 `config.json` 的 `gateway` 段配置。
+- **`config.json` 热加载**：模型/账号规则、`systemPrompt`、`debug`、日志保留、上游超时与重试在 1 秒内生效；解析失败保留上一份有效配置。端口变更需重启。
+- **用量统计与账号告警**：`stats.json` 持久化近 5 小时用量/耗时统计，账号健康度与告警内联到状态快照，Web 总览与 `monitor` 可查看。
 
 ---
 
 ## 上游 v1.14.21 合并功能
 
-- **Web 控制台**：`-webui` 启用独立管理端口（默认 `8316`），查看总览、账号、模型、日志、配置与凭据（脱敏），支持网页新增/删除账号、切换模型与账号规则、保存日志保留天数与模型 API 鉴权；管理 Key 与端口由 `config.json` 的 `gateway` 段配置。
-- **`config.json` 热加载**：模型黑白名单、按模型限制账号文件、`systemPrompt.fallback/force`、`debug.enabled/fullRequests`、`logs.retentionDays`、`upstream` 超时与重试均在 1 秒内生效；端口变更需重启。
-- **Anthropic Messages API**：`/v1/messages` 与 `/v1/messages/count_tokens`，兼容 `x-api-key`，Claude Code 等客户端可直连。
-- **用量与健康**：`stats.json` 持久化用量/耗时统计，账号健康告警内联到快照，网页总览展示柱线图与告警。
-- **凭据安全**：覆盖/删除前只读校验；主动保活 `-keepalive-hours`（默认每天 22:00）；连续失败阈值、刷新令牌到期展示。
-- **请求诊断**：结构化 JSON 调试日志；`debug.fullRequests` 可记录入站/出站完整请求（凭据脱敏，正文仍属敏感数据）。
-- **11128 渠道校验修复**：出站恒发官方语义的 `X-Conversation-ID` / `-Request-ID` / `-Message-ID`；system 开头的 DeepSeek Harness 身份句做偏移 0 等义改写。
-- **模型/账号规则**：`models.blocklist` / `allowlist`；`models.accounts` 支持 `all` 与按模型指定凭据文件黑白名单。
-- **构建矩阵**：Windows/Linux/macOS 的 x86、x64、ARM、ARM64 产物与 SHA256 清单。
+本次合并在保留本 fork 串行调度、错误分类与成本账本的前提下，带入了上游 CangShui/workbuddy-gateway v1.14.21 的全部功能。
 
-完整配置、网页操作、超时与诊断说明见 [`docs/user-guide.md`](docs/user-guide.md)。
+### Web 控制台
+
+- `serve -webui` 启用独立管理端口（默认 `8316`），与模型 API 端口（默认 `8317`）分离。
+- 页面：总览、账号、模型、日志、配置（脱敏）、凭据（令牌脱敏）、访问设置。
+- 支持网页扫码新增账号、删除凭据、切换模型/账号规则、保存日志保留天数、切换模型 API Key 鉴权。
+- 管理 Key（`gateway.adminKey`）与模型 API Key（`gateway.apiKey`）相互独立；管理台始终要求管理鉴权，关闭模型鉴权不会关闭管理台。
+- 详细启动方式与 `config.json` 示例见 [`docs/user-guide.md`](docs/user-guide.md) 的「webui」章节。
+
+### config.json 热加载
+
+工作目录下的 `config.json` 控制网关行为，修改后约 1 秒生效（端口变更需重启）：
+
+```json
+{
+  "gateway": {
+    "apiPort": 8317,
+    "webPort": 8316,
+    "adminKey": "",
+    "apiKeyEnabled": false,
+    "apiKey": ""
+  },
+  "systemPrompt": { "fallback": "", "force": "" },
+  "debug": { "enabled": false, "fullRequests": false },
+  "logs": { "retentionDays": 0 },
+  "upstream": {
+    "headerTimeoutSeconds": 300,
+    "idleTimeoutSeconds": 120,
+    "transientRetries": 2
+  },
+  "models": {
+    "blocklist": [],
+    "accounts": {
+      "all": { "allowlist": [], "blocklist": [] }
+    }
+  }
+}
+```
+
+- `models.blocklist` / `models.allowlist` 控制模型是否可调用；非空黑白名单不能同时存在。
+- `models.accounts` 支持保留键 `all` 与按模型指定凭据文件白/黑名单。
+- `systemPrompt.fallback` 只在客户端没有 system 时替换保底提示；`force` 在首条 system 末尾追加网关指令（后置，风险自负）。
+- `debug.enabled` 写入 `logs/debug-YYYY-MM-DD.jsonl`；`debug.fullRequests=true` 额外记录完整入站/出站请求（凭据字段脱敏，但正文仍属敏感数据，仅排障时开启）。
+- `logs.retentionDays` 为 `0` 表示保留全部；正数按本地日期保留最近 N 天。
+- `upstream` 段控制首字节超时、流空闲超时与瞬时网络重试次数。
+
+### Anthropic Messages API
+
+- 原生入口 `/v1/messages`（SSE 流式 + 非流式聚合）与 `/v1/messages/count_tokens`。
+- 鉴权同时接受 `Authorization: Bearer <key>` 与 `x-api-key`，Claude Code 可直接把 `ANTHROPIC_BASE_URL` 指向网关。
+- 与 Chat / Responses 共用同一套系统提示词、工具修复、推理历史与 11128 净化规则。
+
+### 统计、告警与日志
+
+- `stats.json` 持久化每模型请求数、Token、首 Token 与耗时，Web 总览与 `monitor` 使用近 5 小时滚动窗口。
+- 账号健康度与告警内联到 `workbuddy-status.json`，Web 总览顶部展示，可跳转日志。
+- 结构化 JSON 调试日志、日志保留与清理；`logs/` 下的运行/调试/部署/前端日志可按天保留。
+
+### 凭据保活与安全校验
+
+- `-keepalive-hours`（默认 `22`）每天固定时刻主动刷新全部账号，只调刷新接口，不请求模型。
+- 覆盖新凭据前校验账号标识、站点与可用性；删除凭据前做只读校验，无法判定时保守保留。
+- 连续刷新失败达到阈值才判定登录态失效；刷新令牌到期时间会在 `status` / `monitor` / Web 账号表展示。
+- 企业成员账号改用分配额度接口，`limitNum=-1` 显示「不限」，不会误判为零余额。
+
+### 模型与账号规则
+
+- 模型黑/白名单命中后从 `/v1/models`、`/health` 与统计表隐藏，请求直接 403，不消耗上游额度。
+- `models.accounts` 可按凭据文件名限制某模型可用账号；全局 `all` 规则与模型专属规则同时生效。
+- 模型能力字段新增 `default_context_length`、`context_length_options`、`capabilities_by_site`，与 `context_length` / `max_output_tokens` 分开表达。
+
+### 11128 渠道校验修复
+
+- **缺会话头**：出站恒发 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`，修复国际站与工具请求的 `11128 conversation id missing`。
+- **身份句前缀**：system 消息以 `You are an AI agent powered by DeepSeek Harness` 开头时（偏移 0、忽略大小写、后缀任意），等义改写为中性前缀，修复 `11128 Illegal API invocation from an unapproved channel`。
+- 两者都有单元测试覆盖；上游若继续收紧渠道校验，可能需要再补规则。
+
+### 构建与文档
+
+- [build.ps1](build.ps1) 支持 Windows / Linux / macOS 的 x86、x64、ARM、ARM64 产物与 SHA256 清单。
+- 完整配置、网页操作、超时、诊断、企业账号与部署说明见 [`docs/user-guide.md`](docs/user-guide.md)。
+
+> 本仓库的 CI（`.github/workflows/release.yml`）与 `build.ps1` 都覆盖上述 9 个平台/架构组合；推送 `v*` tag 后会在 Releases 中发布全部产物与 `SHA256SUMS`。
 
 ## 命令总览
 
@@ -303,8 +382,8 @@ workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
 # 目录模式：加载目录内所有 workbuddy*.json
 workbuddy-gateway serve -auth-dir ./auths
 
-# 上游走代理 + 开启客户端鉴权 + 详细日志
-workbuddy-gateway serve -proxy http://127.0.0.1:7890 -api-key sk-xxx -verbose
+# 上游走代理 + 详细日志（客户端鉴权建议在 config.json 的 gateway 段配置）
+workbuddy-gateway serve -proxy http://127.0.0.1:7890 -verbose
 
 # 关闭凭据热加载
 workbuddy-gateway serve -reload-interval 0
@@ -320,6 +399,15 @@ workbuddy-gateway serve -extra-models deepseek-v4.1-flash
 
 # 关停成本条件探索（回到纯成本分层行为）
 workbuddy-gateway serve -cost-explore-interval 0
+
+# 启用 Web 控制台（独立 8316 端口，管理 Key/端口由 config.json 配置）
+workbuddy-gateway serve -webui
+
+# 主动保活：每天 10:00 与 22:00 各刷新一次全部账号
+workbuddy-gateway serve -keepalive-hours 10,22
+
+# 显式开启后台价格探测（会发真实生成请求，可能消耗积分）
+workbuddy-gateway serve -allow-price-probes
 ```
 
 启动后提供的端点：
@@ -328,9 +416,12 @@ workbuddy-gateway serve -cost-explore-interval 0
 |---|---|---|
 | POST | `/v1/chat/completions`、`/chat/completions` | Chat Completions，支持 SSE 流式与非流式 |
 | POST | `/v1/responses`、`/responses` | OpenAI Responses API |
+| POST | `/v1/messages` | Anthropic Messages API（流式 + 非流式聚合） |
+| POST | `/v1/messages/count_tokens` | Anthropic token 估算（本地近似，不调用上游） |
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
+| GET | `/ui/`、`/admin/api/*` | Web 控制台与只读/管理接口（仅 `-webui` 时监听） |
 | GET | `/` | 简单文本说明 |
 
 后台任务（`serve` 启动后自动运行）：
@@ -338,12 +429,68 @@ workbuddy-gateway serve -cost-explore-interval 0
 | 任务 | 周期 | 说明 |
 |---|---|---|
 | Token 续期检查 | 5 分钟 | 距过期不足 15 分钟自动刷新 |
+| 主动保活 | 每天 `-keepalive-hours` 指定时刻（默认 22:00） | 主动刷新全部账号，只调刷新接口 |
 | 额度扫描 | 5 分钟 | 每凭据 10 秒超时，超时保留旧值；`剩余=0` 标记付费耗尽 |
 | 模型目录刷新 | 60 分钟 | 实时接口 + npm 目录，合并去重后写缓存 |
-| 模型价格探测 | 30 分钟检查 / 每模型 12 小时一轮 | 单轮最多 5 个，仅探测需要确认的模型 |
+| 模型价格探测 | 默认关闭 | 仅 `-allow-price-probes` 时每 30 分钟检查 / 每模型 12 小时一轮 |
 | 每日签到 | 每天 `UTC+8 09:00` | 仅国内站 |
-| 状态快照 | 3 秒 | 写 `workbuddy-status.json` 供 `monitor` 读取 |
+| 状态快照 | 3 秒 | 写 `workbuddy-status.json` 供 `monitor` / Web 控制台读取 |
 | 凭据热加载 | 5 秒 | 扫描凭据新增 / 更新 / 删除 |
+| `config.json` 热加载 | 1 秒 | 规则/提示词/调试/超时变化即时生效，端口需重启 |
+| 用量统计落盘 | 周期写 `stats.json` | Web 总览与 `monitor` 使用近 5 小时窗口 |
+| 日志清理 | 每小时 | 按 `logs.retentionDays` 清理过期日志 |
+
+---
+
+## Web 控制台
+
+Web 控制台是**可选**的独立管理端口，默认不开；模型 API 仍监听 `8317`，管理台默认监听 `8316`。
+
+```bash
+# 启动 API + Web 控制台
+workbuddy-gateway serve -webui
+
+# 浏览器访问（仅本机或 SSH 端口转发）
+http://127.0.0.1:8316/ui/
+```
+
+`config.json` 的 `gateway` 段控制端口与鉴权：
+
+```json
+{
+  "gateway": {
+    "apiPort": 8317,
+    "webPort": 8316,
+    "adminKey": "请替换为 32 位随机管理 Key",
+    "apiKeyEnabled": true,
+    "apiKey": "sk-请替换为模型 API Key"
+  }
+}
+```
+
+| 配置 | 说明 |
+|---|---|
+| `apiPort` | 模型 API 端口，默认 `8317`；`-port` 显式传入时覆盖 |
+| `webPort` | Web 控制台端口，默认 `8316`；仅在 `-webui` 时监听 |
+| `adminKey` | 管理台登录 Key；为空时，**仅本机/回环访问** `/ui/` 可一键生成，且只在弹窗展示一次 |
+| `apiKeyEnabled` | 是否校验模型 API Key；关闭时不带 Key/任意 Key 都可调用 |
+| `apiKey` | 模型 API Key；管理 Key 与它相互独立，不能互相登录 |
+
+页面功能：
+
+- **总览**：账号健康度、告警、站点统计、模型请求量/Token/首 Token/耗时。
+- **账号**：账号表格、套餐、额度、冷却、模型账本；扫码新增账号、删除凭据。
+- **模型**：模型列表、倍率来源、能力字段；切换模型启用/停用。
+- **日志**：运行日志、调试日志、保留天数与立即清理。
+- **配置**：查看/编辑 `config.json`（Key 脱敏），带风险确认。
+- **访问设置**：保存 API/Web 端口、切换模型 API Key 鉴权。
+
+安全注意：
+
+- 管理台默认只监听 `127.0.0.1`；对外访问请置于反向代理 + TLS 之后，并设置强 `adminKey`。
+- 管理台与模型 API 是两个端口、两套 Key；不要把 `8316` 直接暴露到公网。
+- `config.json` 含明文管理 Key / API Key，已被 `.gitignore` 排除，请限制文件权限（`0600`）。
+- 管理接口只接受同源请求；`/admin/api/*` 必须携带 `Authorization: Bearer <adminKey>`。
 
 ---
 
@@ -373,7 +520,7 @@ workbuddy-gateway login -intl -auth workbuddy-intl.json
 
 ## status
 
-查看账号池状态，包含站点、冷却、额度与 Token 过期时间。
+查看账号池状态，包含站点、套餐、冷却、额度、Token/刷新令牌到期时间与模型成本账本。
 
 ```bash
 workbuddy-gateway status
@@ -392,10 +539,16 @@ workbuddy-gateway status
 用户 UID:     uid-xxx
 企业 ID:      (个人账号)
 认证域名:     www.codebuddy.cn
+刷新令牌到期: 2027-09-01 12:00:00 (剩余 8000h0m0s)
+套餐:         pro
+额度:         总额度 2300 / 已用 1200 / 剩余 1100
 冷却状态:     可用
 Token 状态:   有效
 过期时间:     2026-09-22 12:32:07 (剩余 119h30m0s)
+模型账本:     2 个模型（免费 1 / 收费 1）
 ```
+
+> 套餐与刷新令牌到期时间来自上游权益/凭据；查询失败时保留上次结果并标记待刷新，不会误判成免费或已失效。
 
 ---
 
@@ -408,13 +561,15 @@ workbuddy-gateway refresh
 ```
 
 - 成功 / 失败 / 跳过（授权失效）会分别统计。
-- 刷新失败若属于授权类错误，会禁用该账号并删除凭据文件。
+- 单次刷新失败只累计失败次数，不立即删凭据；连续失败达到阈值才停止调度。
+- 刷新成功后、覆盖旧凭据前，会校验新凭据的账号标识、站点与可用性，防止串号或用坏凭据覆盖好凭据。
+- WAF 形态的 403 只软冷却，不删除凭据；普通 403 无法判定时保守保留。
 
 ---
 
 ## monitor
 
-前台实时监控，周期刷新展示「账号表格 + 模型统计附表 + 最近日志」，`Ctrl+C` 退出。
+前台实时监控，周期刷新展示「账号表格 + 模型统计附表 + 最近日志」，`Ctrl+C` 退出。Web 控制台（`-webui`）提供更完整的图表与账号/模型管理；两者读取同一份状态快照，不互相替代。
 
 ```bash
 # 必须在 serve 的工作目录执行（读取 workbuddy-status.json）
@@ -481,6 +636,8 @@ workbuddy-gateway monitor -interval 2 -lines 20
 
 免费 / 收费属性按「账号（含站点）+ 模型」学习，只有该账号真正请求过该模型才会写入账本。默认调度优先使用有余额账号，**余额耗尽的账号几乎不会被选中，也就学不到属性**。`probe` 用于主动补课。
 
+> 后台自动价格探测默认关闭（`-allow-price-probes` 才开启），但 `probe` 是**显式主动探测**，仍会发起真实模型请求，可能消耗积分。
+>
 > 注意：额度耗尽的账号会被上游整体拒绝（`14018 Credits exhausted`），此时连免费模型也会失败。要验证某模型是否免费，请使用**额度未耗尽**的账号。
 
 ```bash
@@ -527,7 +684,7 @@ workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.4
 | `skipped` | 账号失效或无凭据 |
 | `error` | 网络 / 协议错误 |
 
-> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；服务启用 `-api-key` 时同样需要鉴权。
+> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；开启模型 API 鉴权时需携带 `config.json` 的 `gateway.apiKey`。
 
 ---
 
@@ -542,11 +699,12 @@ workbuddy-gateway reset
 清理范围：
 
 - `workbuddy-status.json`（账号与模型状态快照）
+- `stats.json`（用量与耗时统计）
 - `wb-models-cache.json`（模型目录、倍率、价格探测结论）
 - `*.disabled` / `*.json.disabled`（授权失效标记）
-- `logs/`（运行日志）
+- `logs/`（运行日志、调试日志、构建/部署日志）
 
-保留：`workbuddy*.json` 登录凭据。
+保留：`workbuddy*.json` 登录凭据、`config.json` 配置。
 
 清理后会立即重新拉取模型目录与倍率。账号账本同时存在于 `serve` 进程内存中，若服务正在运行，请重启使其同步归零：
 
@@ -587,10 +745,12 @@ workbuddy-gateway serve -auth-dir ./auths
 
 - **轮询**：请求按 round-robin 在可用账号间分发。
 - **429 冷却**：`6004` 只冷却触发模型；无法归因到模型的 429 才进入账号级冷却，冷却到期自动恢复。
-- **授权失效**：401，或 403 携带业务信封且命中失效文案时，禁用账号并删除凭据文件，同时写 `*.disabled` 标记；重新 `login` 后自动恢复。WAF 形态的 403（无业务信封）只软冷却，不删凭据。
-- **额度耗尽**：`剩余=0` 标记「付费耗尽」，仍可服务已确认免费的模型。
-- **热加载**：默认每 5 秒扫描，新增 / 更新 / 删除凭据免重启。
+- **授权失效**：401，或 403 携带业务信封且命中失效文案时，先停止调度并写 `*.disabled` 标记；删除凭据前做只读校验，确认不可用才删除，网络/5xx/普通 403 无法判定时保守保留。重新 `login` 后自动恢复。WAF 形态的 403（无业务信封）只软冷却，不删凭据。
+- **额度耗尽**：`剩余=0` 标记「付费耗尽」，仍可服务已确认免费的模型；企业账号 `limitNum=-1` 显示「不限」，不按零余额处理。
+- **热加载**：默认每 5 秒扫描，新增 / 更新 / 删除凭据免重启；Web 控制台也可扫码新增/删除账号。
+- **主动保活**：`-keepalive-hours` 默认每天 22:00 刷新全部账号，避免刷新令牌静默过期。
 - **串行化**：同一账号请求严格排队，避免并发双发触发风控；不同账号可并行。
+- **模型/账号规则**：`config.json` 的 `models.blocklist` / `allowlist` 控制模型是否可调用；`models.accounts` 可按模型限制凭据文件，全局 `all` 与模型专属规则同时生效。
 
 ---
 
@@ -619,6 +779,8 @@ workbuddy-gateway serve -auth-dir ./auths
 
 **价格探测**：由「余额未耗尽」的同站点账号发一次最小请求实测。
 
+> **默认关闭**：后台自动价格探测仅在显式传入 `-allow-price-probes` 时运行；默认情况下不会产生额外探测请求。正常客户端请求仍会从 `usage.credit` 学习免费/收费状态。
+
 ```text
 探测免费 → 展示 0.00x，并每 12 小时复测确认
 探测收费 → 展示 收费(倍率未知)，直到接口重新给出未过期的 0.00x
@@ -629,8 +791,8 @@ workbuddy-gateway serve -auth-dir ./auths
 
 | 时机 | 说明 |
 |---|---|
-| 服务启动 | 启动后约 20 秒执行首轮 |
-| 首次 / 重置后 | 单轮最多 30 个，快速补齐结论 |
+| 服务启动（仅显式开启时） | 启动后约 20 秒执行首轮 |
+| 首次 / 重置后（仅显式开启时） | 单轮最多 30 个，快速补齐结论 |
 | 收敛后 | 单轮最多 5 个，每模型 12 小时最多一次 |
 | 待探测未清空 | 用 2 分钟短间隔追赶，清空后回到 30 分钟 |
 | 目录刷新成功 | 立即触发一轮 |
@@ -638,13 +800,23 @@ workbuddy-gateway serve -auth-dir ./auths
 
 仅探测被实际请求过、或接口明确需要确认的模型，避免无谓消耗额度。
 
+**模型能力字段**：`/v1/models` 会透出上游目录声明的 `context_length`、`max_output_tokens`、`default_context_length`、`context_length_options`、`capabilities_by_site`、`supports_images`、`supports_tool_call`、`reasoning_supported_efforts`、`reasoning_default_effort`。零值/未声明字段一律省略，不编造默认窗口。
+
+**模型与账号规则**：`config.json` 可设置模型黑/白名单，被禁模型从 `/v1/models`、`/health` 的 `model_count` 与统计表隐藏；`models.accounts` 可按凭据文件名限制某模型的可用账号。请求命中禁用模型或无可用账号时返回 403，不消耗上游额度。
+
 `/v1/models` 响应头 `X-Model-Source` 与 `/health` 的 `model_source` 会标注目录来源。
 
 ---
 
 ## 客户端接入
 
-网关启动后服务地址为 `http://127.0.0.1:8317/v1`。
+网关启动后的地址：
+
+- OpenAI 兼容：`http://127.0.0.1:8317/v1`
+- Anthropic：`http://127.0.0.1:8317`（Claude Code 会请求 `/v1/messages`）
+- Web 控制台：`http://127.0.0.1:8316/ui/`（仅 `-webui` 时）
+
+如果 `config.json` 开启了 `gateway.apiKeyEnabled`，客户端需携带对应的 `Authorization: Bearer <apiKey>`（Anthropic 客户端也可用 `x-api-key`）。未开启时任意 Key 均可。
 
 curl：
 
@@ -667,6 +839,26 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+Claude Code（Anthropic 协议直连，免外部翻译层）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+export ANTHROPIC_API_KEY=你的模型APIKey   # config.json 未开启 apiKeyEnabled 时随意填
+claude
+```
+
+网关在 `/v1/messages` 完成 Anthropic → Chat 双向转译：`thinking` 内容块、`tool_use` / `tool_result`、`stop_reason`（`tool_calls→tool_use`、`length→max_tokens`）都会映射；账号池轮询、工具序列自愈、11128 净化与 Chat 入口共用同一套逻辑。
+
+Anthropic Messages curl：
+
+```bash
+curl -N -s http://127.0.0.1:8317/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: 你的模型APIKey" \
+  -d '{"model":"hy4-preview","max_tokens":256,"stream":true,
+       "messages":[{"role":"user","content":"你好"}]}'
+```
+
 DSH（`~/.dsh/settings.yaml`）：
 
 ```yaml
@@ -686,14 +878,28 @@ llm-pi-ai:
 
 ## 各平台部署
 
-> **产物来源说明**：本仓库的 CI 仅构建并发布 **Linux** 产物（`amd64` / `arm64`），
-> 见 [本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases)。
-> Windows / macOS 产物请从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases)下载，
-> 或按[从源码构建](#从源码构建)自行交叉编译（两者命令行接口一致）。
+> **产物来源说明**：本仓库的 [build.ps1](build.ps1) 与 GitHub Actions（`.github/workflows/release.yml`）都支持 Windows / Linux / macOS 的 x86、x64、ARM、ARM64 完整矩阵，并生成 SHA256 清单/SHA256SUMS。
+> 推送 `v*` tag 后，可直接从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases)下载对应平台产物；
+> 也可以本地运行 `build.ps1`。
+
+### 本地构建全部产物
+
+```powershell
+# 完整矩阵（Windows / Linux / macOS，输出到 dist/）
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+# 只构建 Linux ARM64
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Only linux -Architecture arm64
+
+# 清理后重建，并跳过测试（不推荐）
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Clean -SkipTests
+```
+
+脚本会先用当前 Go 工具链交叉编译（`CGO_ENABLED=0`），再生成 `SHA256SUMS` 与 `build-manifest.json`。产物命名与 Release 一致。
 
 ### Windows
 
-1. 从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`，或本地交叉编译：
+1. 从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases) 下载 `workbuddy-gateway-windows-amd64.exe`（或 386 / arm64），或用本仓库 `build.ps1` 本地构建，或直接交叉编译：
 
    ```powershell
    $env:GOOS='windows'; $env:GOARCH='amd64'; $env:CGO_ENABLED='0'
@@ -767,7 +973,9 @@ sudo systemctl status workbuddy-gateway
 sudo journalctl -u workbuddy-gateway -f
 ```
 
-> `WorkingDirectory` 决定自动发现的凭据目录。把多个凭据文件放进该目录即可组成账号池，新增 / 更新 / 删除会自动热加载。
+> `WorkingDirectory` 决定自动发现的凭据目录与 `config.json` 位置。把多个凭据文件放进该目录即可组成账号池，新增 / 更新 / 删除会自动热加载。
+>
+> 需要 Web 控制台时，在 `ExecStart` 追加 `-webui`，并在 `WorkingDirectory` 放置 `config.json`（配置 `gateway.webPort` / `gateway.adminKey`）。管理台默认监听 `127.0.0.1:8316`，不要把 8316 直接暴露到公网。
 
 常用运维：
 
@@ -777,7 +985,7 @@ sudo systemctl stop workbuddy-gateway
 sudo systemctl disable workbuddy-gateway
 ```
 
-对外开放时（例如局域网其他设备）把 `-addr` 改为 `0.0.0.0`，并**务必**设置 `-api-key`：
+对外开放时（例如局域网其他设备）把 `-addr` 改为 `0.0.0.0`，并**务必**在 `config.json` 的 `gateway` 段开启 `apiKeyEnabled` 并设置强 `apiKey`；旧的 `-api-key` 仍可作为一次性覆盖：
 
 ```ini
 ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 8317 -api-key sk-changeme
@@ -785,7 +993,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ### macOS
 
-1. 从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-darwin-arm64`（Apple Silicon）或 `workbuddy-gateway-darwin-amd64`（Intel）；也可本地交叉编译：
+1. 从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases) 下载 `workbuddy-gateway-darwin-arm64`（Apple Silicon）或 `workbuddy-gateway-darwin-amd64`（Intel）；也可用 `build.ps1` 或本地交叉编译：
 
    ```bash
    GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-darwin-arm64 .
@@ -834,30 +1042,41 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 ## 安全提示
 
 - `workbuddy*.json` 包含真实访问凭据（Access Token / Refresh Token），**严禁提交到 Git 或公开分享**；本仓库 `.gitignore` 已排除。
-- 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0` 并配合 `-api-key`，或置于反向代理之后。
+- `config.json` 含明文 `gateway.adminKey` / `gateway.apiKey`，同样已被 `.gitignore` 排除；请设置 `0600` 权限，不要提交或贴到公开渠道。
+- 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0`，并在 `config.json` 开启 `apiKeyEnabled` 设置强 Key，或置于反向代理之后。
+- Web 控制台是独立端口（默认 `8316`），默认只监听回环；对外访问必须走反向代理 + TLS，并设置强 `adminKey`。管理 API 使用 `Authorization: Bearer <adminKey>`，不接受模型 API Key。
 - `/admin/probe` 仅接受回环来源调用。
+- `debug.fullRequests=true` 会记录完整对话、工具参数与图片，即使凭据已脱敏仍属敏感数据；仅排障期间开启，并沿用 `logs.retentionDays` 清理。
 - 不再需要某账号授权时，删除对应凭据文件并在 CodeBuddy 控制台撤销授权。
 
 ---
 
 ## 从源码构建
 
-需要 Go 1.26+（`go.mod` 要求 1.26.5）：
+需要 Go 1.26.5+（`go.mod` 要求 1.26.5）：
 
 ```bash
 git clone https://github.com/gakiyukr/workbuddy_to_api_plus.git
 cd workbuddy_to_api_plus
 
 go vet ./...
-go test ./...
+go test -count=1 ./...
 
 # 当前平台
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o workbuddy-gateway .
 
+# 需要 Web 控制台时，准备配置（可复制示例后修改 adminKey/apiKey）
+cp config.example.json config.json
+
 # 交叉编译示例
 GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-linux-amd64 .
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-windows-amd64.exe .
+
+# Windows 一键构建完整矩阵（PowerShell）
+powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
+
+> 编译产物**不依赖 tag**：`go build` 或 `build.ps1` 在任何提交上都能直接产出二进制。tag 只用于触发 GitHub Actions 发布 Release。
 
 ---
 
@@ -866,16 +1085,19 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o d
 推送 `v*` 形式的 tag 时，GitHub Actions（`.github/workflows/release.yml`）会自动：
 
 1. 运行 `go vet` + `go test`（不通过则中止，不发布坏产物）；
-2. 交叉编译 Linux 静态二进制（`amd64` / `arm64`，`CGO_ENABLED=0`）；
-3. 生成 `sha256` 校验文件并创建 GitHub Release，产物直接可下载。
+2. 交叉编译 9 个平台/架构组合（Windows/Linux/macOS 的 x86、x64、ARMv7、ARM64，`CGO_ENABLED=0`）；
+3. 为每个产物生成 `.sha256`，并生成汇总 `SHA256SUMS`；
+4. 创建 GitHub Release 并上传全部产物，下载即可用。
 
-发布前会校验 tag 与 `main.go` 中的 `version` 常量一致，避免名实不符。发版流程：
+发布前会校验 tag 与 `main.go` 中的 `version` 常量一致，避免名实不符。当前 `main.go` 的版本是 `1.15.0`。
+
+发版流程：
 
 ```bash
-# 1. bump main.go 中的 version 常量
+# 1. bump main.go 中的 version 常量（当前为 1.15.0）
 # 2. 提交后打 tag 并推送
-git commit -am "chore: bump version to 1.14.1"
-git tag -a v1.14.1 -m "WorkBuddy Local Gateway v1.14.1"
+git commit -am "chore: bump version to 1.15.0"
+git tag -a v1.15.0 -m "WorkBuddy Local Gateway v1.15.0"
 git push origin main --follow-tags
 ```
 
