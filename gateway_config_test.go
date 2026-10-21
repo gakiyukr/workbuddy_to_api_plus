@@ -242,7 +242,7 @@ func TestGatewayAPIKeyToggleAndRoleSeparation(t *testing.T) {
 	admin := initTestAdmin(t, web)
 	api := newAPIHandler()
 	apiStatus := func(key string) int {
-		return adminRequest(api, http.MethodPost, "/v1/messages/count_tokens", key, `{"messages":[]}`).Code
+		return adminRequest(api, http.MethodGet, "/v1/models", key, "").Code
 	}
 	if apiStatus("") != 200 || apiStatus("arbitrary-client-key") != 200 {
 		t.Fatal("disabled API authentication must accept no key or any key")
@@ -282,7 +282,7 @@ func TestGatewayAPIKeyToggleAndRoleSeparation(t *testing.T) {
 	}
 	if adminRequest(api, http.MethodGet, "/admin/api/settings", "synthetic-api-key", "").Code != 404 ||
 		adminRequest(api, http.MethodGet, "/ui/", "synthetic-api-key", "").Code != 404 ||
-		adminRequest(web, http.MethodPost, "/v1/messages/count_tokens", admin, `{"messages":[]}`).Code != 404 {
+		adminRequest(web, http.MethodGet, "/v1/models", admin, "").Code != 404 {
 		t.Fatal("API and management routes were not isolated")
 	}
 }
@@ -451,10 +451,10 @@ func TestGatewayLegacyAPIKeyFlagIsAcceptedButInert(t *testing.T) {
 	if _, err := os.Stat(runtimeConfigFile); !os.IsNotExist(err) {
 		t.Fatal("legacy flag must not write config.json")
 	}
-	if code := adminRequest(newAPIHandler(), http.MethodPost, "/v1/messages/count_tokens", "", `{"messages":[]}`).Code; code != 200 {
+	if code := adminRequest(newAPIHandler(), http.MethodGet, "/v1/models", "", "").Code; code != 200 {
 		t.Fatalf("legacy flag changed model API behaviour, status=%d", code)
 	}
-	if code := adminRequest(newAPIHandler(), http.MethodPost, "/v1/messages/count_tokens", "any-client-key", `{"messages":[]}`).Code; code != 200 {
+	if code := adminRequest(newAPIHandler(), http.MethodGet, "/v1/models", "any-client-key", "").Code; code != 200 {
 		t.Fatalf("arbitrary key should still work while API auth is disabled, status=%d", code)
 	}
 	// 场景二：config.json 已配置 Key，旧参数不得覆盖配置。
@@ -469,7 +469,7 @@ func TestGatewayLegacyAPIKeyFlagIsAcceptedButInert(t *testing.T) {
 	if currentAPIKey() != "synthetic-config-key" {
 		t.Fatal("legacy flag must not override config.json")
 	}
-	if code := adminRequest(newAPIHandler(), http.MethodPost, "/v1/messages/count_tokens", "synthetic-other-key", `{"messages":[]}`).Code; code != 401 {
+	if code := adminRequest(newAPIHandler(), http.MethodGet, "/v1/models", "synthetic-other-key", "").Code; code != 401 {
 		t.Fatalf("legacy flag value must not authenticate, status=%d", code)
 	}
 }

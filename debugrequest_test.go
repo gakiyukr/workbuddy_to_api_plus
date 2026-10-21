@@ -136,7 +136,7 @@ func TestFullRequestsConfigHotSwitch(t *testing.T) {
 	if err := applyRuntimeConfig(c, true, "toggle-test"); err != nil {
 		t.Fatal(err)
 	}
-	r := httptest.NewRequest("POST", "/v1/messages", nil)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	if !fullRequestLoggingEnabled(r) {
 		t.Fatal("not enabled")
 	}
@@ -174,8 +174,8 @@ func TestFullRequestsTransportReadsNeitherRequestNorResponse(t *testing.T) {
 	}
 }
 
-func TestFullRequestsThreeProtocolChains(t *testing.T) {
-	for _, route := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+func TestFullRequestsTwoProtocolChains(t *testing.T) {
+	for _, route := range []string{"/v1/chat/completions", "/v1/responses"} {
 		t.Run(route, func(t *testing.T) {
 			isolatePolicies(t)
 			_, records := fullRequestTestLog(t)

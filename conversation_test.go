@@ -129,10 +129,10 @@ func conversationFixtureSSE(tool bool) string {
 		"data: [DONE]\n\n"
 }
 
-// 3 协议 × 流式/聚合 × 国内/国际 × 文本/工具，共 24 条真实处理器路径。
+// 2 协议 × 流式/聚合 × 国内/国际 × 文本/工具，共 16 条真实处理器路径。
 func TestConversationHeadersAllProtocolsStreamsSitesAndTools(t *testing.T) {
 	for _, site := range []string{"cn", "intl"} {
-		for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+		for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
 			for _, stream := range []bool{false, true} {
 				for _, tool := range []bool{false, true} {
 					name := site + path
@@ -190,13 +190,6 @@ func TestConversationHeadersAllProtocolsStreamsSitesAndTools(t *testing.T) {
 								body["reasoning"] = map[string]any{"effort": "high"}
 								body["tools"] = []any{map[string]any{"type": "function", "name": "noop",
 									"parameters": map[string]any{"type": "object"}}}
-							}
-						case "/v1/messages":
-							body["messages"] = []any{map[string]any{"role": "user", "content": "test"}}
-							body["max_tokens"] = 64
-							if tool {
-								body["thinking"] = map[string]any{"type": "enabled", "effort": "high"}
-								body["tools"] = []any{map[string]any{"name": "noop", "input_schema": map[string]any{"type": "object"}}}
 							}
 						default:
 							body["messages"] = []any{map[string]any{"role": "user", "content": "test"}}

@@ -56,7 +56,7 @@ func TestTTFTDeltaDefinition(t *testing.T) {
 }
 
 // 每条协议响应路径都实际消费分阶段SSE：先角色/心跳，再Token；确保计时不是首字节。
-// 六路径+纯控制流/截断流，验证日志、CLI模型快照与持久化样本用同一个duration。
+// 四路径+纯控制流/截断流，验证日志、CLI模型快照与持久化样本用同一个duration。
 func TestTTFTAllResponsePaths(t *testing.T) {
 	handlers := []struct {
 		name string
@@ -73,12 +73,6 @@ func TestTTFTAllResponsePaths(t *testing.T) {
 		}},
 		{"responses_aggregate", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
 			writeResponsesAggregate(w, r, resp, "metric-model", 1, a, &profileCN, s)
-		}},
-		{"messages_stream", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
-			streamMessagesResponse(w, r, resp, "metric-model", 1, a, &profileCN, s, true)
-		}},
-		{"messages_aggregate", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
-			writeMessagesAggregate(w, r, resp, "metric-model", 1, a, &profileCN, s, true)
 		}},
 	}
 	for _, handler := range handlers {

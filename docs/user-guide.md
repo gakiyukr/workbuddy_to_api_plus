@@ -61,10 +61,9 @@
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
 - **授权失效自动禁用**：401/403 / `invalid token` / 登录过期时禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复。
 - **后台自动续期**：每 5 分钟检查 Token，距过期不足 15 分钟自动刷新并写回凭据文件；另可按 `-keepalive-hours` 在固定时刻主动刷新全部账号（默认每天 22:00），避免长期空闲账号静默失效。
-- **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免 Anthropic 翻译层误判 `stop_reason` 导致工具不执行。
+- **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免部分协议翻译层误判结束原因导致工具不执行。
 - **工具调用序列自愈**：出站前按 `tool_call_id` 修复并行调用中夹入 message 的历史结构，合并 Responses API 拆散的并行调用，并删除无配对调用、孤儿或重复结果，避免国际站返回 `11148 tool_call_sequence_broken`。
 - **OpenAI 兼容协议**：`/v1/chat/completions`（SSE 流式 + 非流式聚合）、`/v1/responses`（Responses API）、`/v1/models`、`/health`。
-- **Anthropic 协议原生入口**：`/v1/messages`（SSE 流式 + 非流式聚合）与 `/v1/messages/count_tokens`，Claude Code 等 Anthropic 客户端免外部翻译层直连，鉴权兼容 `x-api-key` 头。
 
 ---
 
@@ -190,13 +189,13 @@ workbuddy-gateway serve -webui -allow-price-probes
 | 配置 | 空值的默认行为 | 非空时的行为 |
 |---|---|---|
 | `fallback` | 继续使用 `You are a helpful assistant.` | **仅在客户端没有任何 system 时**，替换网关注入的保底提示词；已有 system 不变 |
-| `force` | 不启用；请求提示词完全按原规则处理 | **实验功能**：在 Chat、Responses、Anthropic Messages 三个入口的首条 system 内容**末尾追加**配置文本（后置），使其成为位置最靠后、紧贴用户消息的指令；原 system 内容仍完整保留 |
+| `force` | 不启用；请求提示词完全按原规则处理 | **实验功能**：在 Chat、Responses 两个入口的首条 system 内容**末尾追加**配置文本（后置），使其成为位置最靠后、紧贴用户消息的指令；原 system 内容仍完整保留 |
 
 例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和普通 JSON 调试模式只记录规则分支、位置与字符数；显式开启 `debug.fullRequests` 后，完整请求事件会包含处理前后的提示词正文。
 
 > **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并保存；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
 
-`/v1/messages/count_tokens` 仅对客户端提供的内容做本地近似估算，不调用上游，也不计入网关随后注入的 `fallback` / `force` 文本；最终消耗以模型返回的 usage 为准。
+最终消耗以模型返回的 usage 为准。
 
 ### 套餐识别与官网一致性
 
@@ -459,8 +458,6 @@ workbuddy-gateway serve -models-refresh 0
 |---|---|---|
 | POST | `/v1/chat/completions`、`/chat/completions` | Chat Completions，支持 SSE 流式与非流式 |
 | POST | `/v1/responses`、`/responses` | OpenAI Responses API |
-| POST | `/v1/messages` | Anthropic Messages API（Claude Code 直连，内部转 Chat 走同一条上游管线） |
-| POST | `/v1/messages/count_tokens` | Anthropic 令牌计数（本地估算，CJK 1 token/字、ASCII 4 字符/token） |
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
@@ -767,7 +764,7 @@ systemctl restart workbuddy-gateway
 国际站带工具声明的请求此前可能触发 `11128 conversation id missing`；这项兼容不关闭工具或思考，
 也不改变提示词、输出预算和原有鉴权指纹。
 
-- 三个协议入口（Chat Completions、Responses、Anthropic Messages）、流式与非流式聚合、
+- 两个协议入口（Chat Completions、Responses）、流式与非流式聚合、
   国内与国际站都经过同一出站路径；手工 `probe` 和后台价格探测也有统一兜底。
 - 优先读取客户端 `X-Conversation-ID`，再读取 `X-Session-ID`、
   请求顶层或 `metadata` 内的 `conversation_id`／`conversationId`／`session_id`／`sessionId`。
@@ -985,7 +982,7 @@ workbuddy-gateway serve -auth-dir ./auths
 - **积分只取 `usage.credit`**，不用「账号余额差」推算，避免把并发请求和额度刷新算成消耗。
 - **缺失的 usage 记为空样本，不是零消耗**：接口返回 `—` 和「Token 1/2 请求有样本」这样的覆盖数，0 与未知可以区分。
 - **缓存读取已包含在输入 Token 内**，单独展示但不重复累加。
-- **首 Token 耗时（TTFT v2）**：从网关请求入口开始，到解析出首个非空文本、推理或有效工具调用增量结束；心跳、角色声明、空内容、usage、finish、DONE 不计入。工具名称或非空参数增量计入，单独工具 ID 不计入。三个协议的流式／非流式、普通日志、CLI 与网页使用同一测量结果，截断或取消的请求不进入 TTFT 平均。
+- **首 Token 耗时（TTFT v2）**：从网关请求入口开始，到解析出首个非空文本、推理或有效工具调用增量结束；心跳、角色声明、空内容、usage、finish、DONE 不计入。工具名称或非空参数增量计入，单独工具 ID 不计入。两个协议的流式／非流式、普通日志、CLI 与网页使用同一测量结果，截断或取消的请求不进入 TTFT 平均。
 - **完整性判定**：只由上游流本身决定——读取出错或没有结束原因都不计；已确认完整结束后，客户端收到 `[DONE]` 就断开连接属于正常行为，不再因为事后看到请求 Context 已取消而丢弃该次首 Token 样本（v1.14.9 修复）。
 - **与 dsh 的边界**：采用相同的有效增量判据，但网关起点是收到 HTTP 请求（拿不到 dsh 的 `step/start`），无法计入客户端前置耗时；网关仍按所选时间／账号／模型汇总所有调用，包括辅助请求，不是 dsh 单个会话的平均。非流式时测量上游生成的首 Token，而非客户端收到完整 JSON 的时刻。
 - **历史兼容**：新请求记录带 `ttftMetric: "first_token_v2"`。旧记录的首响应体耗时保留但不参与新 TTFT 平均；Token、积分和历史总耗时仍正常汇总，网页显示被排除的旧口径样本数。新记录的总耗时也以网关请求入口计时，避免排队后出现首Token比总耗时更大的口径冲突。
@@ -1050,19 +1047,6 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
-
-Claude Code（Anthropic 协议直连，免外部翻译层）：
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
-export ANTHROPIC_API_KEY=你的模型APIKey   # config.json 未开启 apiKeyEnabled 时随意填
-claude
-```
-
-> 网关在 `/v1/messages` 入口完成 Anthropic → Chat 双向转译：思维链回译为 `thinking` 内容块、
-> `tool_calls` 回译为 `tool_use`、`finish_reason` 映射 `stop_reason`（`tool_calls→tool_use`、
-> `length→max_tokens`），并复用账号池轮询、工具序列自愈与 WAF 脱敏管线。
-> 模型名直接填网关 `/v1/models` 列表中的 ID。
 
 DSH（`~/.dsh/settings.yaml`）：
 

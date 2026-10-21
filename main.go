@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	version = "1.15.0"
+	version = "1.15.1"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -3931,7 +3931,6 @@ func runServe() {
 	fmt.Printf("WorkBuddy 本地网关已启动\n")
 	fmt.Printf("   服务监听地址:  http://%s\n", listenAddr)
 	fmt.Printf("   Chat 接口地址: http://%s/v1/chat/completions\n", listenAddr)
-	fmt.Printf("   Claude Code:   http://%s/v1/messages (ANTHROPIC_BASE_URL 指向本网关)\n", listenAddr)
 	fmt.Printf("   Models 接口:   http://%s/v1/models\n", listenAddr)
 	fmt.Printf("   模型转发策略:  【完全透传】客户端请求的任意 model 原样中继至上游\n")
 	_, modelSource := mergedModelIDs()
@@ -4176,7 +4175,7 @@ func authMiddleware(next http.Handler) http.Handler {
 		if apiKey != "" && !isAuthExemptPath(r.URL.Path) {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
-			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
+			// 兼容部分使用 x-api-key 头携带密钥的客户端。
 			if token == "" {
 				token = r.Header.Get("x-api-key")
 			}
@@ -5033,7 +5032,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- POST /v1/responses\n- POST /v1/messages (Anthropic)\n- POST /v1/messages/count_tokens\n- GET  /v1/models\n- GET  /health\n", version)
+	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- POST /v1/responses\n- GET  /v1/models\n- GET  /health\n", version)
 }
 
 // -----------------------------------------------------------------------------
@@ -6183,7 +6182,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 // cleanChunkJSON 清洗单个上游 chat 分片，使其符合 OpenAI 流式分片规范后再透传。
 //
 // 上游是「类 OpenAI」实现，分片里带有若干偏离规范的噪声。普通 OpenAI 客户端能忍，
-// 但 Anthropic 协议翻译层（Claude Code 链路）会据此误判流状态，导致工具不执行：
+// 但部分客户端/协议翻译层会据此误判流状态，导致工具不执行：
 //
 //  1. finish_reason:"" → null（本 bug 的直接原因）。规范要求中间分片为 null、只有终止分片
 //     给出真实原因；上游却在整条流的每一个分片上都下发 finish_reason:""。

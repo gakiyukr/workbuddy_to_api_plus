@@ -55,14 +55,11 @@ jobs:
         run: |
           out="workbuddy-gateway-${{ matrix.suffix }}"
           go build -trimpath -ldflags="-s -w" -o "$out" .
-          sha256sum "$out" > "$out.sha256"
 
       - uses: actions/upload-artifact@v7
         with:
           name: workbuddy-gateway-${{ matrix.suffix }}
-          path: |
-            workbuddy-gateway-${{ matrix.suffix }}
-            workbuddy-gateway-${{ matrix.suffix }}.sha256
+          path: workbuddy-gateway-${{ matrix.suffix }}
           if-no-files-found: error
 
   release:
@@ -108,7 +105,7 @@ jobs:
             echo "| \`workbuddy-gateway-linux-amd64\` | Linux x86_64 |"
             echo "| \`workbuddy-gateway-linux-arm64\` | Linux ARM64 |"
             echo
-            echo "均为静态链接单二进制（CGO 关闭），下载后 \`chmod +x\` 即可运行；校验见同名 \`.sha256\` 文件。"
+            echo "均为静态链接单二进制（CGO 关闭），下载后 \`chmod +x\` 即可运行；GitHub 资产页会自动显示每个文件的 SHA256 digest。"
             echo
             echo "其他平台/架构不随本 Release 发布，可在本地运行 \`build.ps1\` 构建。"
             echo
@@ -132,6 +129,4 @@ jobs:
             --title "WorkBuddy Local Gateway ${GITHUB_REF_NAME}" \
             --notes-file notes.md \
             dist/workbuddy-gateway-linux-amd64 \
-            dist/workbuddy-gateway-linux-amd64.sha256 \
-            dist/workbuddy-gateway-linux-arm64 \
-            dist/workbuddy-gateway-linux-arm64.sha256
+            dist/workbuddy-gateway-linux-arm64

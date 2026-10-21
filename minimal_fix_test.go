@@ -138,9 +138,9 @@ func TestMinimalAuthKeepsExtractionCompatibility(t *testing.T) {
 	}{
 		{"bearer", "/v1/responses", "Bearer compatibility-secret", "", 204},
 		{"raw header", "/v1/responses", "compatibility-secret", "", 204},
-		{"x-api-key", "/v1/messages", "", cfg.APIKey, 204},
-		{"empty bearer fallback", "/v1/messages", "Bearer ", cfg.APIKey, 204},
-		{"wrong authorization takes precedence", "/v1/messages", "Bearer wrong", cfg.APIKey, 401},
+		{"x-api-key", "/v1/responses", "", cfg.APIKey, 204},
+		{"empty bearer fallback", "/v1/responses", "Bearer ", cfg.APIKey, 204},
+		{"wrong authorization takes precedence", "/v1/responses", "Bearer wrong", cfg.APIKey, 401},
 		{"lowercase bearer unchanged", "/v1/responses", "bearer compatibility-secret", cfg.APIKey, 401},
 		{"missing", "/v1/responses", "", "", 401},
 		{"different same length", "/v1/responses", "compatibility-secreu", "", 401},

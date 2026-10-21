@@ -11,7 +11,7 @@ import (
 
 // -----------------------------------------------------------------------------
 // 本文件锁定一个静默失败：上游在**每一个**分片上都下发 finish_reason:""，
-// 而 Anthropic 协议翻译层（Claude Code 链路）会取流中「第一个非 null 的
+// 而部分协议翻译层会取流中「第一个非 null 的
 // finish_reason」作为最终 stop_reason，于是首个分片的空串把 stop_reason 锁成
 // end_turn，真实终止分片的 "tool_calls" 不再被采纳 —— Claude Code 只在
 // stop_reason=tool_use 时才执行工具，工具因此永不执行、终端毫无结果。

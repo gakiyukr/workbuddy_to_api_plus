@@ -194,33 +194,3 @@ func TestResponsesEntryKeepsClientMaxOutputTokens(t *testing.T) {
 		t.Fatalf("Responses 入口覆盖了客户端输出预算: %#v", got)
 	}
 }
-
-func TestMessagesEntryInjectsMaxTokensWhenClientOmitsBudget(t *testing.T) {
-	withCatalogModels(t, maxTokensCatalog())
-	var captured []byte
-	withFakeUpstream(t, &captured)
-	body := `{"model":"budget-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
-	rec := httptest.NewRecorder()
-	handleMessages(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if got := decodeUpstreamBody(t, captured)["max_tokens"]; got != float64(128000) {
-		t.Fatalf("Anthropic 入口未补输出预算: %#v\n%s", got, captured)
-	}
-}
-
-func TestMessagesEntryKeepsClientMaxTokens(t *testing.T) {
-	withCatalogModels(t, maxTokensCatalog())
-	var captured []byte
-	withFakeUpstream(t, &captured)
-	body := `{"model":"budget-model","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`
-	rec := httptest.NewRecorder()
-	handleMessages(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if got := decodeUpstreamBody(t, captured)["max_tokens"]; got != float64(1024) {
-		t.Fatalf("Anthropic 入口覆盖了客户端输出预算: %#v", got)
-	}
-}

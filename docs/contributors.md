@@ -54,9 +54,9 @@
 - 采纳内容: 通过真实出站请求抓包与二分定位，确认上游会对 system 消息开头的
   `You are an AI agent powered by DeepSeek Harness` 做渠道校验并返回 11128；
   同时验证了前导空白、正文中段和 user 消息不会触发。
-- 落地方式: 新增 `sanitizeprefix.go`，在三个协议入口统一将 system 开头的该身份句
-  等义改写为中性前缀，正文其余部分逐字保留；补充边界、数组 content、
-  `developer` 归一化和三协议入口测试。
+- 落地方式: 新增 `sanitizeprefix.go`，在 OpenAI 兼容入口（Chat / Responses）统一将
+  system 开头的该身份句等义改写为中性前缀，正文其余部分逐字保留；补充边界、数组 content、
+  `developer` 归一化与两个入口的测试。
 - 关联版本: v1.14.21 起
 - 贡献者图: 通过 GitHub noreply 署名提交记录
 

@@ -341,7 +341,7 @@ func convertResponsesInputItem(item map[string]any) []any {
 			"content":      text,
 		}}
 		if len(images) > 0 {
-			// 与 Anthropic tool_result 的图片处理一致：tool 保留文本，
+			// 与部分协议 tool_result 的图片处理一致：tool 保留文本，
 			// 图片提升成 user 多模态内容，不能把 Base64 当普通文本回放。
 			// handleResponses 随后的工具序列修复会将并行批次的图片消息
 			// 移至全部 tool 结果之后，避免打断调用/结果配对（11148）。

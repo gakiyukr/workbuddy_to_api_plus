@@ -5,7 +5,7 @@
 
 基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。支持 CLI 与可选的 Web 控制台（`-webui`，管理 Key / 端口 / 模型 API 鉴权由 `config.json` 配置），登录、凭据续期、账号与模型管理均可在命令行或网页完成。
 
-> **合并说明（2026-10-21）**：本仓库已合并上游 [CangShui/workbuddy-gateway](https://github.com/CangShui/workbuddy-gateway) **v1.14.21** 的全部功能，包括 Web 控制台、`config.json` 热加载、Anthropic Messages API（`/v1/messages`）、用量统计与账号告警、凭据保活与删除前校验、模型/账号黑白名单、完整请求诊断、官方会话头族与 DeepSeek Harness 前缀净化等。上游完整使用手册见 [`docs/user-guide.md`](docs/user-guide.md)；本文件保留本 fork 的串行调度、错误分类、成本账本与移植来源说明。
+> **合并说明（2026-10-21）**：本仓库已合并上游 [CangShui/workbuddy-gateway](https://github.com/CangShui/workbuddy-gateway) **v1.14.21** 的主要功能，包括 Web 控制台、`config.json` 热加载、用量统计与账号告警、凭据保活与删除前校验、模型/账号黑白名单、完整请求诊断、官方会话头族与 DeepSeek Harness 前缀净化等。Anthropic Messages API 已按本仓库需求移除，仅保留 OpenAI 兼容端点。上游完整使用手册见 [`docs/user-guide.md`](docs/user-guide.md)；本文件保留本 fork 的串行调度、错误分类、成本账本与移植来源说明。
 
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
@@ -205,7 +205,7 @@
 - **免费/收费学习**：按「账号 + 模型」从响应 `usage.credit` 学习；`credit=0` 且样本足够（`total_tokens ≥ 100`）才判定免费，避免小样本误判。
 - ✦ **错误分类体系**：13 个 `errKind`（12 个实际分类 + `errNone` 兜底）区分「账号的问题」与「请求的问题」——前者冷却 / 禁用该账号并换号重试，后者不罚账号直接透传，避免把请求级错误记到账号头上。（移植 wb2api 的 `ErrKind`）
 - ✦ **WAF 拦截识别**：403 且响应体无业务信封（无 `code` / `msg` 字段）判定为 WAF 拦截形态，仅软冷却 60 秒、**不删除凭据**；带业务信封的 403 才走授权失效判定。（修复基线误删凭据缺陷）
-- ✦ **指纹脱敏**：出站请求体清洗上游内容审核拒绝的字面量（Claude Code / Codex 模板句、Anthropic 计费头键值对、`11-128` 字面量），改写单字破坏精确匹配而保留语义；覆盖 `content` / `reasoning_content` / `tool_calls.arguments` 三个字段。（基线实现恒为 no-op，本仓库修复）
+- ✦ **指纹脱敏**：出站请求体清洗上游内容审核拒绝的字面量（部分 CLI 模板句、计费头键值对、`11-128` 字面量），改写单字破坏精确匹配而保留语义；覆盖 `content` / `reasoning_content` / `tool_calls.arguments` 三个字段。（基线实现恒为 no-op，本仓库修复）
 - ✦ **官方会话头族**：出站恒发 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`，语义对齐官方 WorkBuddy 5.8.4 客户端；同一次逻辑请求的换号/重试复用同一组标识，修复国际站与工具请求的 `11128 conversation id missing`。会话键支持入站头、`X-Session-ID` 与 body/metadata 字段，非 UUID 会话键按调用方隔离生成稳定 UUIDv5。（替换早期 wb2api 的 B3/Root 头方案）
 - ✦ **内容拦截降级重试**：passthrough / append 模式下首遇内容拦截时，切换到中性系统提示词（直至次日 CST 00:00）同请求重试一次，破解模板句指纹误报；custom 模式已是网关提示词，不进入降级。
 - **成本账本与分层选号**：每次成功请求按 `usage.credit` 折算每千 token 单价（EMA α=0.3 平滑、6 小时过期）记入「账号 + 模型」账本；选号时按 **免费 > 未知 > 收费** 硬过滤分层，收费层内单价低者优先，避免把流量浪费在贵号上。
@@ -227,9 +227,8 @@
 - **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
 - **授权失效安全处理**：401，或 403 携带业务信封且命中失效文案（`invalid token` / 登录过期等）时，先停止调度并写失效标记；删除凭据前还会做一次只读校验，确认凭据确实不可用才删除，网络/5xx/普通 403 无法判定时保守保留。**WAF 形态的 403 只软冷却，不删凭据**。
 - **后台自动续期 + 主动保活**：每 5 分钟检查 Token，距过期不足 15 分钟自动刷新；另可用 `-keepalive-hours`（默认每天 22:00）在固定时刻主动刷新全部账号，避免长期空闲账号静默失效。连续刷新失败达到阈值才判定登录态失效。
-- **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免 Anthropic 翻译层误判 `stop_reason` 导致工具不执行；流正常关闭但没有 `finish_reason` 时拒绝伪造 `[DONE]`，向客户端下发明确的中断错误。
+- **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免部分协议翻译层误判结束原因导致工具不执行；流正常关闭但没有 `finish_reason` 时拒绝伪造 `[DONE]`，向客户端下发明确的中断错误。
 - **OpenAI 兼容协议**：`/v1/chat/completions`（SSE 流式 + 非流式聚合）、`/v1/responses`（Responses API）、`/v1/models`、`/health`。
-- **Anthropic Messages API**：`/v1/messages`（流式 + 非流式聚合）与 `/v1/messages/count_tokens`，鉴权兼容 `x-api-key`，Claude Code 等 Anthropic 客户端无需外部翻译层。
 - **Web 控制台（可选）**：`-webui` 启用独立管理端口（默认 8316），提供总览、账号、模型、日志、配置与凭据（脱敏）管理；管理 Key 与模型 API Key 相互独立，均由 `config.json` 的 `gateway` 段配置。
 - **`config.json` 热加载**：模型/账号规则、`systemPrompt`、`debug`、日志保留、上游超时与重试在 1 秒内生效；解析失败保留上一份有效配置。端口变更需重启。
 - **用量统计与账号告警**：`stats.json` 持久化近 5 小时用量/耗时统计，账号健康度与告警内联到状态快照，Web 总览与 `monitor` 可查看。
@@ -238,7 +237,7 @@
 
 ## 上游 v1.14.21 合并功能
 
-本次合并在保留本 fork 串行调度、错误分类与成本账本的前提下，带入了上游 CangShui/workbuddy-gateway v1.14.21 的全部功能。
+本次合并在保留本 fork 串行调度、错误分类与成本账本的前提下，带入了上游 CangShui/workbuddy-gateway v1.14.21 的主要功能。Anthropic Messages API 已移除，网关只提供 OpenAI 兼容协议。
 
 ### Web 控制台
 
@@ -285,12 +284,6 @@
 - `logs.retentionDays` 为 `0` 表示保留全部；正数按本地日期保留最近 N 天。
 - `upstream` 段控制首字节超时、流空闲超时与瞬时网络重试次数。
 
-### Anthropic Messages API
-
-- 原生入口 `/v1/messages`（SSE 流式 + 非流式聚合）与 `/v1/messages/count_tokens`。
-- 鉴权同时接受 `Authorization: Bearer <key>` 与 `x-api-key`，Claude Code 可直接把 `ANTHROPIC_BASE_URL` 指向网关。
-- 与 Chat / Responses 共用同一套系统提示词、工具修复、推理历史与 11128 净化规则。
-
 ### 统计、告警与日志
 
 - `stats.json` 持久化每模型请求数、Token、首 Token 与耗时，Web 总览与 `monitor` 使用近 5 小时滚动窗口。
@@ -321,7 +314,7 @@
 - [build.ps1](build.ps1) 支持 Windows / Linux / macOS 的 x86、x64、ARM、ARM64 产物与 SHA256 清单。
 - 完整配置、网页操作、超时、诊断、企业账号与部署说明见 [`docs/user-guide.md`](docs/user-guide.md)。
 
-> 本仓库 CI（`.github/workflows/release.yml`）**只发布 Linux `amd64` / `arm64`** 两个产物及同名 `.sha256`；`build.ps1` 仍支持在本地构建完整矩阵，但不会随 Release 发布其他平台。
+> 本仓库 CI（`.github/workflows/release.yml`）**只发布 Linux `amd64` / `arm64`** 两个产物；GitHub 会在 Release 资产页自动显示每个文件的 SHA256 digest，不再额外上传 `.sha256` 文件。`build.ps1` 仍支持在本地构建完整矩阵，但不会随 Release 发布其他平台。
 
 ## 命令总览
 
@@ -416,8 +409,6 @@ workbuddy-gateway serve -allow-price-probes
 |---|---|---|
 | POST | `/v1/chat/completions`、`/chat/completions` | Chat Completions，支持 SSE 流式与非流式 |
 | POST | `/v1/responses`、`/responses` | OpenAI Responses API |
-| POST | `/v1/messages` | Anthropic Messages API（流式 + 非流式聚合） |
-| POST | `/v1/messages/count_tokens` | Anthropic token 估算（本地近似，不调用上游） |
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
@@ -813,10 +804,9 @@ workbuddy-gateway serve -auth-dir ./auths
 网关启动后的地址：
 
 - OpenAI 兼容：`http://127.0.0.1:8317/v1`
-- Anthropic：`http://127.0.0.1:8317`（Claude Code 会请求 `/v1/messages`）
 - Web 控制台：`http://127.0.0.1:8316/ui/`（仅 `-webui` 时）
 
-如果 `config.json` 开启了 `gateway.apiKeyEnabled`，客户端需携带对应的 `Authorization: Bearer <apiKey>`（Anthropic 客户端也可用 `x-api-key`）。未开启时任意 Key 均可。
+如果 `config.json` 开启了 `gateway.apiKeyEnabled`，客户端需携带对应的 `Authorization: Bearer <apiKey>`。未开启时任意 Key 均可。
 
 curl：
 
@@ -837,26 +827,6 @@ resp = client.chat.completions.create(
     messages=[{"role": "user", "content": "写一个快速排序"}],
 )
 print(resp.choices[0].message.content)
-```
-
-Claude Code（Anthropic 协议直连，免外部翻译层）：
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
-export ANTHROPIC_API_KEY=你的模型APIKey   # config.json 未开启 apiKeyEnabled 时随意填
-claude
-```
-
-网关在 `/v1/messages` 完成 Anthropic → Chat 双向转译：`thinking` 内容块、`tool_use` / `tool_result`、`stop_reason`（`tool_calls→tool_use`、`length→max_tokens`）都会映射；账号池轮询、工具序列自愈、11128 净化与 Chat 入口共用同一套逻辑。
-
-Anthropic Messages curl：
-
-```bash
-curl -N -s http://127.0.0.1:8317/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: 你的模型APIKey" \
-  -d '{"model":"hy4-preview","max_tokens":256,"stream":true,
-       "messages":[{"role":"user","content":"你好"}]}'
 ```
 
 DSH（`~/.dsh/settings.yaml`）：
@@ -917,24 +887,22 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Clean -SkipTests
 
 ### Linux
 
-从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest) 下载（含 `.sha256` 校验文件）：
+从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest) 下载：
 
 ```bash
 # x86_64
 wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-amd64
-wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-amd64.sha256
-sha256sum -c workbuddy-gateway-linux-amd64.sha256
 sudo install -m 755 workbuddy-gateway-linux-amd64 /usr/local/bin/workbuddy-gateway
 
 # ARM64
 wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-arm64
-wget https://github.com/gakiyukr/workbuddy_to_api_plus/releases/latest/download/workbuddy-gateway-linux-arm64.sha256
-sha256sum -c workbuddy-gateway-linux-arm64.sha256
 sudo install -m 755 workbuddy-gateway-linux-arm64 /usr/local/bin/workbuddy-gateway
 
 workbuddy-gateway login
 workbuddy-gateway serve -addr 127.0.0.1 -port 8317
 ```
+
+> GitHub Release 资产页会自动显示每个文件的 `sha256:` digest，可直接用于核对；不需要额外下载 `.sha256` 文件。
 
 #### systemd 服务（推荐）
 
@@ -1086,18 +1054,17 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 1. 运行 `go vet` + `go test`（不通过则中止，不发布坏产物）；
 2. 交叉编译 Linux `amd64` / `arm64` 静态二进制（`CGO_ENABLED=0`）；
-3. 为每个产物生成同名 `.sha256`；
-4. 创建 GitHub Release 并上传两个 Linux 产物及校验文件，下载即可用。
+3. 创建 GitHub Release 并上传两个 Linux 产物；GitHub 会自动为每个资产显示 SHA256 digest。
 
-发布前会校验 tag 与 `main.go` 中的 `version` 常量一致，避免名实不符。当前 `main.go` 的版本是 `1.15.0`。
+发布前会校验 tag 与 `main.go` 中的 `version` 常量一致，避免名实不符。当前 `main.go` 的版本是 `1.15.1`。
 
 发版流程：
 
 ```bash
-# 1. bump main.go 中的 version 常量（当前为 1.15.0）
+# 1. bump main.go 中的 version 常量（当前为 1.15.1）
 # 2. 提交后打 tag 并推送
-git commit -am "chore: bump version to 1.15.0"
-git tag -a v1.15.0 -m "WorkBuddy Local Gateway v1.15.0"
+git commit -am "chore: bump version to 1.15.1"
+git tag -a v1.15.1 -m "WorkBuddy Local Gateway v1.15.1"
 git push origin main --follow-tags
 ```
 

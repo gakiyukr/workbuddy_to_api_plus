@@ -95,27 +95,6 @@ func TestSystemPromptConfigurationReachesChatAndResponses(t *testing.T) {
 	}
 }
 
-func TestSystemPromptConfigurationReachesMessages(t *testing.T) {
-	withSystemPrompts(t, "定制保底", "统一规则")
-	for _, tc := range []struct {
-		name, body, want string
-	}{
-		{"fallback", `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`, "定制保底\n\n统一规则"},
-		{"client_system", `{"model":"m","system":"客户端规则","messages":[{"role":"user","content":"hi"}]}`, "客户端规则\n\n统一规则"},
-		{"system_blocks", `{"model":"m","system":[{"type":"text","text":"规则一"},{"type":"text","text":"规则二"}],"messages":[{"role":"user","content":"hi"}]}`, "规则一\n规则二\n\n统一规则"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			messages := captureUpstreamMessages(t, "/v1/messages", tc.body)
-			if got := messages[0].(map[string]any)["content"]; got != tc.want {
-				t.Fatalf("Messages 提示词未统一应用: got=%#v want=%q", got, tc.want)
-			}
-			if got := messages[1].(map[string]any)["content"]; got != "hi" {
-				t.Fatalf("不应修改 user 内容: %#v", got)
-			}
-		})
-	}
-}
-
 // TestForcedPromptIsAppendedAfterClientSystem 固定「客户端原文在前、强制提示词在后」这一契约。
 //
 // 这条顺序直接决定冲突时的实际效果：网关只发送一条 system 消息，内容形如

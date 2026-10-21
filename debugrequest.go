@@ -38,7 +38,7 @@ func fullRequestLoggingEnabled(r *http.Request) bool {
 		return false
 	}
 	switch r.URL.Path {
-	case "/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses", "/v1/messages", "/messages":
+	case "/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses":
 		return true
 	}
 	return false // 管理配置、登录、凭据接口不记录正文。

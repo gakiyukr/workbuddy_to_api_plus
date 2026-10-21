@@ -96,13 +96,12 @@ func TestSanitizeMessagesDeveloperNormalizedBeforePrefix(t *testing.T) {
 	}
 }
 
-func TestPrefixSanitizedOnAllProtocolEntrypoints(t *testing.T) {
+func TestPrefixSanitizedOnOpenAIEntrypoints(t *testing.T) {
 	cases := []struct {
 		name, path, body string
 	}{
 		{"chat", "/v1/chat/completions", `{"model":"deepseek-v4.1-flash","stream":false,"max_tokens":64,"messages":[{"role":"system","content":"You are an AI agent powered by DeepSeek Harness. Keep this system."},{"role":"user","content":"hi"}]}`},
 		{"responses", "/v1/responses", `{"model":"deepseek-v4.1-flash","stream":false,"max_output_tokens":64,"input":[{"role":"developer","content":"You are an AI agent powered by DeepSeek Harness. Keep this system."},{"role":"user","content":"hi"}]}`},
-		{"messages", "/v1/messages", `{"model":"deepseek-v4.1-flash","stream":false,"max_tokens":64,"system":"You are an AI agent powered by DeepSeek Harness. Keep this system.","messages":[{"role":"user","content":"hi"}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

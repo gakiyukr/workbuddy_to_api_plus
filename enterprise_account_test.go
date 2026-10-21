@@ -169,20 +169,17 @@ func TestEnterpriseQuotaFullHTTPFlow(t *testing.T) {
 	if err := refreshAccountQuota(context.Background(), acc); err != nil {
 		t.Fatal(err)
 	}
-	for _, route := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+	for _, route := range []string{"/v1/chat/completions", "/v1/responses"} {
 		body := chatBody
 		if route == "/v1/responses" {
 			body = `{"model":"` + model + `","stream":false,"input":"hello"}`
-		}
-		if route == "/v1/messages" {
-			body = `{"model":"` + model + `","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hello"}]}`
 		}
 		if status, raw := request(route, body, "synthetic-api-key"); status != 200 || !strings.Contains(raw, "enterprise OK") {
 			t.Fatalf("%s status=%d response=%s", route, status, raw)
 		}
 	}
-	if chatCalls.Load() != 3 {
-		t.Fatalf("chat calls=%d want 3", chatCalls.Load())
+	if chatCalls.Load() != 2 {
+		t.Fatalf("chat calls=%d want 2", chatCalls.Load())
 	}
 	mode.Store(1)
 	if err := refreshAccountQuota(context.Background(), acc); err != nil {

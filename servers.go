@@ -15,8 +15,6 @@ func newAPIHandler() http.Handler {
 	mux.HandleFunc("/chat/completions", handleChatCompletions)
 	mux.HandleFunc("/v1/responses", handleResponses)
 	mux.HandleFunc("/responses", handleResponses)
-	mux.HandleFunc("/v1/messages", handleMessages)
-	mux.HandleFunc("/v1/messages/count_tokens", handleCountTokens)
 	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/models", handleModels)
 	mux.HandleFunc("/health", handleHealth)
