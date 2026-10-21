@@ -8,6 +8,21 @@ last-*.json
 .workbuddy-*.json
 wb-models-cache.json
 wb-models-cache.json.tmp
+config.json
+stats.json
+.env
+.env.*
+!.env.example
+!.env.sample
+.netrc
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+.ssh/
+backups/
 
 # 本地编译产物
 workbuddy-gateway
@@ -20,3 +35,9 @@ logs/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# 本地工具缓存、历史材料与可能包含环境信息的报告
+.codex-tmp/
+.playwright-mcp/
+docs/local/
+archive/local/

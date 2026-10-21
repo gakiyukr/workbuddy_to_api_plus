@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // TestMain 将整个测试进程切到临时工作目录，确保任何写状态/缓存/日志的测试
@@ -43,10 +46,21 @@ func chdirTemp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(t.TempDir()); err != nil {
+	// 不使用 t.TempDir()：它的清理时机与「切回原工作目录」的相对顺序无法保证，
+	// 而 Windows 不允许删除仍是当前工作目录的目录，顺序错了会留下无效 cwd，
+	// 进而让后续测试的 os.Getwd/os.Chdir 全部失效。
+	dir, err := os.MkdirTemp("", "workbuddy-test-cwd-")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(old) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// 必须在同一个清理里先恢复工作目录、再删除，顺序不能颠倒。
+		_ = os.Chdir(old)
+		_ = os.RemoveAll(dir)
+	})
 }
 
 // 验证 429 消息中的重置时间解析
@@ -356,11 +370,102 @@ func TestMarkModelQuotaBlockedDoesNotOverwriteAccountBalance(t *testing.T) {
 	remaining := acc.QuotaRemaining
 	exhausted := acc.QuotaExhausted
 	accountMu.Unlock()
-	if state == nil || !state.QuotaBlocked || state.CostClass != modelCostPaid {
+	if state == nil || !state.QuotaBlocked {
 		t.Fatalf("model block missing: %+v", state)
 	}
 	if remaining != 123 || exhausted {
 		t.Fatalf("model 14018 must not overwrite account balance: remaining=%v exhausted=%v", remaining, exhausted)
+	}
+}
+
+// 14018 只表示账号额度耗尽，与模型收费属性无关。
+// 已知免费模型遇到 14018 时，必须保持 free 分类，不能被错误改写成 paid。
+func TestQuotaBlockedMustNotRewriteFreeModelAsPaid(t *testing.T) {
+	chdirTemp(t)
+	acc := &Account{Path: "free.json", Auth: &StoredAuth{Edition: "intl"}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{
+			"deepseek-v4.1-flash": {CostClass: modelCostFree},
+		}}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	markModelQuotaBlocked(acc, "deepseek-v4.1-flash", "14018 Credits exhausted")
+
+	accountMu.Lock()
+	state := acc.ModelStates["deepseek-v4.1-flash"]
+	accountMu.Unlock()
+	if state.CostClass != modelCostFree {
+		t.Fatalf("14018 must not overwrite a free model's cost class, got %q", state.CostClass)
+	}
+	if !state.QuotaBlocked {
+		t.Fatal("14018 should still block this account for the model until quota recovers")
+	}
+	// 未知模型遇到 14018 也应保持 unknown，不得被当成 paid。
+	acc2 := &Account{Path: "unknown.json", Auth: &StoredAuth{Edition: "intl"}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{"mystery": {CostClass: modelCostUnknown}}}
+	markModelQuotaBlocked(acc2, "mystery", "14018")
+	accountMu.Lock()
+	got := acc2.ModelStates["mystery"].CostClass
+	accountMu.Unlock()
+	if got != modelCostUnknown {
+		t.Fatalf("14018 must not turn an unknown model into paid, got %q", got)
+	}
+}
+
+// 旧版本快照里可能残留「14018 被误写成 paid」的脏数据；恢复时必须降回 unknown。
+func TestSanitizeRestoredModelStateFixesLegacyPaidFromQuotaBlock(t *testing.T) {
+	legacy := &modelRuntimeState{
+		CostClass:    modelCostPaid,
+		QuotaBlocked: true,
+		LastReason:   `{"error":{"data":{"code":14018,"msg":"Credits exhausted."}}}`,
+	}
+	sanitizeRestoredModelState(legacy)
+	if legacy.CostClass != modelCostUnknown {
+		t.Fatalf("legacy 14018-derived paid should be reset to unknown, got %q", legacy.CostClass)
+	}
+	if !legacy.QuotaBlocked {
+		t.Fatal("quota block should be preserved")
+	}
+
+	// 真正由 credit 证据学到的收费模型（非额度耗尽导致）必须保持 paid。
+	genuinePaid := &modelRuntimeState{CostClass: modelCostPaid}
+	sanitizeRestoredModelState(genuinePaid)
+	if genuinePaid.CostClass != modelCostPaid {
+		t.Fatalf("genuine paid model must stay paid, got %q", genuinePaid.CostClass)
+	}
+
+	// 免费模型不受影响。
+	free := &modelRuntimeState{CostClass: modelCostFree, QuotaBlocked: true}
+	sanitizeRestoredModelState(free)
+	if free.CostClass != modelCostFree {
+		t.Fatalf("free model must stay free, got %q", free.CostClass)
+	}
+}
+
+// QuotaBlocked 必须短路调度，避免额度耗尽账号被反复选中探测。
+func TestQuotaBlockedShortCircuitsScheduling(t *testing.T) {
+	acc := &Account{Path: "exhausted.json", Auth: &StoredAuth{}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{
+			"m": {CostClass: modelCostUnknown, QuotaBlocked: true},
+		}}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+	if _, _, err := nextAccountForModel("m", nil); err == nil {
+		t.Fatal("quota-blocked account must not be selected for the model")
 	}
 }
 
@@ -481,6 +586,16 @@ func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
 	result, err = checkinAccount(context.Background(), intl)
 	if err != nil || result != "global_skipped" || calls != 1 {
 		t.Fatalf("intl should be skipped: result=%q calls=%d err=%v", result, calls, err)
+	}
+
+	enterprise := &Account{Path: "enterprise.json", Auth: &StoredAuth{
+		Edition: "cn",
+		Auth:    StoredTokens{AccessToken: "test-access"},
+		Account: StoredAccount{UID: "user-1", EnterpriseID: "ent-1"},
+	}}
+	result, err = checkinAccount(context.Background(), enterprise)
+	if err != nil || result != "enterprise_skipped" || calls != 1 {
+		t.Fatalf("enterprise checkin must not call personal endpoint: result=%q calls=%d err=%v", result, calls, err)
 	}
 }
 
@@ -1018,7 +1133,8 @@ func TestNextAccountAllDisabled(t *testing.T) {
 	t.Logf("all-disabled error: %v", err)
 }
 
-// 验证 disableAccount：标记失效、删除凭据文件、写入失效标记文件
+// 验证 disableAccount：停止调度并写入失效标记。
+// 删除凭据需要「只读校验明确确认不可用」，测试环境没有 HTTP 客户端时应保守保留文件。
 func TestDisableAccount(t *testing.T) {
 	dir := t.TempDir()
 	authPath := dir + "/workbuddy-test.json"
@@ -1044,9 +1160,9 @@ func TestDisableAccount(t *testing.T) {
 	if reason == "" {
 		t.Fatal("disabled reason should be recorded")
 	}
-	// 凭据文件应被删除
-	if _, err := os.Stat(authPath); !os.IsNotExist(err) {
-		t.Fatalf("credential file should be deleted, stat err=%v", err)
+	// 无法确认凭据失效时必须保留文件：删除不可逆，误删只能重新登录。
+	if _, err := os.Stat(authPath); err != nil {
+		t.Fatalf("无法确认凭据失效时应保留凭据文件, stat err=%v", err)
 	}
 	// 失效标记文件应存在
 	if _, err := os.Stat(markerPath(authPath)); err != nil {
@@ -1404,7 +1520,7 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		FreeModels:     1,
 		ModelCooldowns: 2,
 	}})
-	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "付费用户", "免费模型", "模型冷却", "1100", "否"} {
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却", "1100", "免费"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
@@ -1578,12 +1694,62 @@ func TestUnknownModelQuotaProbeStopsAfterOneExhaustedAccount(t *testing.T) {
 
 func TestParseQuotaSummary(t *testing.T) {
 	data := []byte(`{"Packages":[{"CycleTotalCapacity":"1500","CycleUsedCapacity":"69.98999993","CycleRemainCapacity":"1430.01000007"},{"CycleTotalCapacity":"500","CycleUsedCapacity":"500","CycleRemainCapacity":"0"}],"IsPaidUser":true}`)
-	total, used, remaining, paid, err := parseQuotaSummary(data)
+	total, used, remaining, paid, plan, err := parseQuotaSummary(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != 2000 || used != 569.98999993 || remaining != 1430.01000007 || !paid {
 		t.Fatalf("unexpected quota summary: total=%v used=%v remaining=%v paid=%v", total, used, remaining, paid)
+	}
+	if plan != planUnknown {
+		t.Fatalf("summary alone cannot establish the current plan, got %q", plan)
+	}
+}
+
+// 摘要标记不再直接当成当前有效权益。
+func TestPlanLabelFromSummary(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"历史试用标记", `{"ProTrialStatus":1,"IsPaidUser":false}`, planUnknown},
+		{"字符串试用标记", `{"ProTrialStatus":"1","IsPaidUser":false}`, planUnknown},
+		{"试用与付费标记同时存在", `{"ProTrialStatus":1,"IsPaidUser":true}`, planUnknown},
+		{"付费标记不能决定等级", `{"ProTrialStatus":0,"IsPaidUser":true}`, planUnknown},
+		{"空标记也要查有效权益", `{"ProTrialStatus":0,"IsPaidUser":false}`, planUnknown},
+		{"字段缺失", `{"Packages":[]}`, planUnknown},
+		{"类型异常", `{"ProTrialStatus":{"unexpected":true},"IsPaidUser":false}`, planUnknown},
+		{"国内站无试用标记", `{"IsPaidUser":false,"SubscriptionPackageCode":""}`, planUnknown},
+		{"未知订阅包", `{"IsPaidUser":false,"SubscriptionPackageCode":"pkg-code-000"}`, planUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var summary quotaSummaryData
+			if err := json.Unmarshal([]byte(tc.json), &summary); err != nil {
+				t.Fatal(err)
+			}
+			if got := planLabelFromSummary(summary); got != tc.want {
+				t.Fatalf("plan=%q want=%q", got, tc.want)
+			}
+		})
+	}
+}
+
+// 套餐列必须展示 Pro试用/pro/免费，且不再出现 1 和 0。
+func TestRenderAccountTableShowsPlanLabel(t *testing.T) {
+	table := renderAccountTable([]accountSnapshot{
+		{Path: "intl-trial.json", Edition: "intl", Nickname: "trial@example.com", State: "active", QuotaTotal: 500, QuotaRemaining: 500, QuotaKnown: true, PlanLabel: "Pro试用"},
+		{Path: "cn-paid.json", Edition: "cn", Nickname: "paid@example.com", State: "active", QuotaTotal: 2200, QuotaRemaining: 400, QuotaKnown: true, PlanLabel: "pro"},
+		{Path: "cn-free.json", Edition: "cn", Nickname: "free@example.com", State: "active", QuotaTotal: 2200, QuotaRemaining: 400, QuotaKnown: true, PlanLabel: "免费"},
+	})
+	for _, want := range []string{"套餐", "Pro试用", "pro", "免费"} {
+		if !strings.Contains(table, want) {
+			t.Fatalf("table missing %q:\n%s", want, table)
+		}
+	}
+	if strings.Contains(table, "付费用户") {
+		t.Fatalf("table should no longer contain 付费用户 column:\n%s", table)
 	}
 }
 
@@ -1787,6 +1953,7 @@ func TestAggregateCompletionToolCalls(t *testing.T) {
 		`data: {"id":"cmpl-1","model":"hy3-preview","created":1700000000,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`,
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}`,
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
 	}, "\n")
 
@@ -1882,6 +2049,134 @@ func TestResponsesToChatRequestStringInput(t *testing.T) {
 	}
 	if _, err := responsesToChatRequest(map[string]any{"model": "x"}, "x"); err == nil {
 		t.Fatal("empty input should error")
+	}
+}
+
+// 国际站 thinking 模式要求上一轮助手消息带回 reasoning_content，否则 11155。
+func TestResponsesReasoningContentPassedBack(t *testing.T) {
+	chat, err := responsesToChatRequest(map[string]any{
+		"model": "deepseek-v4.1-flash",
+		"input": []any{
+			map[string]any{"role": "user", "content": "先查天气"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "上一轮推理"},
+			}},
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": `{"city":"BJ"}`},
+			map[string]any{"type": "function_call", "call_id": "call_2", "name": "get_time", "arguments": `{}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+			map[string]any{"type": "reasoning", "content": []any{
+				map[string]any{"type": "reasoning_text", "text": "完整推理"},
+			}, "summary": []any{
+				map[string]any{"type": "summary_text", "text": "不该用这段摘要"},
+			}},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{
+				map[string]any{"type": "output_text", "text": "今天晴"},
+			}},
+			map[string]any{"role": "user", "content": "再说一遍"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "这段不该漏到后面"},
+			}},
+			map[string]any{"role": "user", "content": "下一问"},
+			map[string]any{"type": "message", "role": "assistant", "content": "没有推理的回复"},
+		},
+	}, "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chat["messages"].([]any)
+	if len(messages) != 7 {
+		t.Fatalf("reasoning and parallel calls should form one assistant message: %#v", messages)
+	}
+	call := messages[1].(map[string]any)
+	if call["reasoning_content"] != "上一轮推理" {
+		t.Fatalf("tool call missing reasoning: %#v", call)
+	}
+	if calls, ok := call["tool_calls"].([]any); !ok || len(calls) != 2 {
+		t.Fatalf("parallel calls were not grouped: %#v", call)
+	}
+	tool := messages[2].(map[string]any)
+	if _, ok := tool["reasoning_content"]; ok {
+		t.Fatalf("tool result must not carry reasoning: %#v", tool)
+	}
+	answer := messages[3].(map[string]any)
+	if answer["reasoning_content"] != "完整推理" {
+		t.Fatalf("content text should win over summary, got %#v", answer)
+	}
+	plain := messages[len(messages)-1].(map[string]any)
+	if _, ok := plain["reasoning_content"]; ok {
+		t.Fatalf("reasoning before a user turn leaked forward: %#v", plain)
+	}
+}
+
+func TestResponsesExplicitAssistantReasoningContentIsPreserved(t *testing.T) {
+	chat, err := responsesToChatRequest(map[string]any{"input": []any{
+		map[string]any{"role": "user", "content": "hi"},
+		map[string]any{"type": "message", "role": "assistant", "content": "ok", "reasoning_content": "original thinking"},
+	}}, "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant := chat["messages"].([]any)[1].(map[string]any)
+	if assistant["reasoning_content"] != "original thinking" {
+		t.Fatalf("explicit assistant reasoning was dropped: %#v", assistant)
+	}
+}
+
+// 回归：reasoning+正文+并行工具调用来自同一次 Responses 回复，Chat 上游只能看到
+// 一条 assistant 消息；推理放在这条消息上，工具结果紧随其后而不重复推理。
+func TestResponsesReasoningTextAndCallsShareOneAssistant(t *testing.T) {
+	chat, err := responsesToChatRequest(map[string]any{
+		"model":     "deepseek-v4.1-flash",
+		"reasoning": map[string]any{"effort": "high"},
+		"input": []any{
+			map[string]any{"role": "user", "content": "检查一下"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "先看日志"},
+			}},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{
+				map[string]any{"type": "output_text", "text": "我先查日志"},
+			}},
+			map[string]any{"type": "function_call", "call_id": "call_a", "name": "read", "arguments": `{}`},
+			map[string]any{"type": "web_search_call", "id": "ws_1"},
+			map[string]any{"type": "function_call", "call_id": "call_b", "name": "grep", "arguments": `{}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_a", "output": "file"},
+			map[string]any{"type": "function_call_output", "call_id": "call_b", "output": "match"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "确认了"},
+			}},
+			map[string]any{"type": "message", "role": "assistant", "content": "完成"},
+		},
+	}, "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := repairToolMessageSequence(chat)
+	messages := chat["messages"].([]any)
+	if len(messages) != 5 || report.MovedMessages != 0 || report.MergedCallMessages != 0 {
+		t.Fatalf("unexpected chat topology: report=%+v messages=%#v", report, messages)
+	}
+	assistant := messages[1].(map[string]any)
+	if assistant["reasoning_content"] != "先看日志" {
+		t.Fatalf("reasoning was not attached to the original reply: %#v", assistant)
+	}
+	parts, ok := assistant["content"].([]any)
+	if !ok || len(parts) != 1 || parts[0].(map[string]any)["text"] != "我先查日志" {
+		t.Fatalf("text was not attached to the same reply: %#v", assistant)
+	}
+	calls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("parallel tools were not attached to the same reply: %#v", assistant)
+	}
+	if messages[2].(map[string]any)["role"] != "tool" || messages[3].(map[string]any)["role"] != "tool" {
+		t.Fatalf("tool outputs not adjacent to their call: %#v", messages)
+	}
+	last := messages[4].(map[string]any)
+	if last["reasoning_content"] != "确认了" || last["content"] != "完成" {
+		t.Fatalf("next reply lost reasoning or text: %#v", last)
+	}
+	attached, chars, missing := reasoningPassthroughStats(chat)
+	if attached != 2 || chars != len([]rune("先看日志确认了")) || missing != 0 {
+		t.Fatalf("reasoning replay audit is incorrect: %d %d %d", attached, chars, missing)
 	}
 }
 
@@ -2547,21 +2842,13 @@ func TestDropTruncatedToolCalls(t *testing.T) {
 	}
 }
 
-// 验证聚合路径：EOF 截断（未见 [DONE]）时残缺调用被丢弃，不把脏参数交给客户端。
+// 验证聚合路径：EOF 截断（未见 [DONE] 且无 finish_reason）时拒绝伪装成完整回复，
+// 由调用方下发中断错误，而不是把残缺输出交给客户端。
 func TestAggregateDropsTruncatedToolCallsOnEOF(t *testing.T) {
 	// 无 [DONE] 收尾：上游连接中断
 	stream := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\"}}]}}]}\n\n"
-	out, err := aggregateCompletion(strings.NewReader(stream), "m")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var resp map[string]any
-	if err := json.Unmarshal(out, &resp); err != nil {
-		t.Fatal(err)
-	}
-	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
-	if _, ok := msg["tool_calls"]; ok {
-		t.Fatalf("EOF 截断的残缺调用应被丢弃: %#v", msg["tool_calls"])
+	if _, err := aggregateCompletion(strings.NewReader(stream), "m"); !errors.Is(err, errStreamClosedWithoutFinish) {
+		t.Fatalf("未见 [DONE]/finish_reason 的流应返回 errStreamClosedWithoutFinish，实际 %v", err)
 	}
 }
 
@@ -3659,20 +3946,24 @@ func TestChatPathUsesChatClient(t *testing.T) {
 	}
 }
 
-// 验证两个客户端的超时分工：默认有总时长（默认安全），聊天无总时长（长流不切）。
+// 验证超时分层：客户端不设总时长（长流不被硬切），控制类请求由 ctx 兜底，
+// 首字节与流中空闲各有独立阈值且可热更新。
 func TestClientTimeoutSplit(t *testing.T) {
-	if upstreamDefaultTimeout <= 0 {
-		t.Fatal("默认客户端必须有总时长：挂死的连接会永久占用调用方 goroutine")
+	header, idle, retries := upstreamSettings()
+	if header <= 0 || idle <= 0 {
+		t.Fatalf("首字节与空闲阈值必须为正值，实际 header=%v idle=%v", header, idle)
 	}
-	if upstreamHeaderTimeout <= 0 || upstreamHeaderTimeout >= upstreamDefaultTimeout {
-		t.Fatalf("首字节超时应为正值且短于默认总时长，实际 %v vs %v", upstreamHeaderTimeout, upstreamDefaultTimeout)
+	if retries < 0 {
+		t.Fatalf("瞬时重试次数不能为负，实际 %d", retries)
 	}
-	if upstreamIdleTimeout <= 0 {
-		t.Fatal("流中空闲阈值应为正值")
+	if defaultRequestTimeout <= 0 {
+		t.Fatal("控制类请求必须有 ctx 超时兜底")
 	}
-	// 空闲阈值必须显著大于正常思考间隙，否则会误杀健康长流
-	if upstreamIdleTimeout <= upstreamHeaderTimeout {
-		t.Fatalf("空闲阈值应大于首字节超时，实际 %v vs %v", upstreamIdleTimeout, upstreamHeaderTimeout)
+	if cfg.HttpClient != nil && cfg.HttpClient.Timeout != 0 {
+		t.Fatalf("共享客户端不应设总时长，实际 %v", cfg.HttpClient.Timeout)
+	}
+	if chatClient != nil && chatClient.Timeout != 0 {
+		t.Fatalf("聊天客户端不应设总时长，实际 %v", chatClient.Timeout)
 	}
 }
 
@@ -3881,54 +4172,32 @@ func TestValidB3TraceID(t *testing.T) {
 	}
 }
 
-// 验证 backendHeaders 注入完整的会话头族，且聚合主键与消息级 ID 各司其职。
-func TestBackendHeadersConversationFamily(t *testing.T) {
-	convReqID := newMessageID()
-	req, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
-	backendHeaders(req, &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "tok"}}, &profileCN, convReqID, newMessageID())
+// 验证 backendHeaders 注入官方 WorkBuddy 语义的会话头族：三个 X-Conversation-*
+// 恒发且为合法 UUID，X-Request-ID/X-Trace-ID 为标准 UUID；不再发送 B3/Root 头。
+func TestBackendHeadersOfficialConversationFamily(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+	backendHeaders(req, &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "tok"}}, &profileCN)
 
-	// 聚合主键：两处头同值
-	if got := req.Header.Get("X-Conversation-Request-ID"); got != convReqID {
-		t.Errorf("X-Conversation-Request-ID = %q, want %q", got, convReqID)
+	for _, name := range []string{
+		"X-Conversation-ID",
+		"X-Conversation-Request-ID",
+		"X-Conversation-Message-ID",
+		"X-Request-ID",
+		"X-Trace-ID",
+	} {
+		value := req.Header.Get(name)
+		if _, err := uuid.Parse(value); err != nil {
+			t.Errorf("%s 不是合法 UUID: %q (%v)", name, value, err)
+		}
 	}
-	if got := req.Header.Get("X-Root-Request-ID"); got != convReqID {
-		t.Errorf("X-Root-Request-ID = %q, want %q", got, convReqID)
+	if got := req.Header.Get("X-Conversation-Message-ID"); len(got) != 32 || strings.Contains(got, "-") {
+		t.Errorf("X-Conversation-Message-ID 应为 32 位无连字符 UUID，实际 %q", got)
 	}
-	// B3 TraceId 用聚合主键（32 hex 合法）
-	if got := req.Header.Get("X-B3-TraceId"); got != convReqID {
-		t.Errorf("X-B3-TraceId = %q, want %q", got, convReqID)
+	if got := req.Header.Get("X-Root-Request-ID"); got != "" {
+		t.Errorf("不应再发送 X-Root-Request-ID，实际 %q", got)
 	}
-	// 消息级 ID 独立
-	if got := req.Header.Get("X-Conversation-Message-ID"); got == convReqID {
-		t.Errorf("X-Conversation-Message-ID 不应与聚合主键相同")
-	}
-	if got := req.Header.Get("X-B3-SpanId"); got != req.Header.Get("X-Conversation-Message-ID")[:16] {
-		t.Errorf("X-B3-SpanId = %q, want messageID 前 16 位", got)
-	}
-	if got := req.Header.Get("X-B3-Sampled"); got != "1" {
-		t.Errorf("X-B3-Sampled = %q, want 1", got)
-	}
-	// 消息级 ID 形态合法
-	if !validB3TraceID(req.Header.Get("X-Request-ID")) {
-		t.Errorf("X-Request-ID 非合法 hex: %q", req.Header.Get("X-Request-ID"))
-	}
-}
-
-// 验证非法 B3 TraceId 时回落到消息级 ID（不破坏链路关联）。
-func TestBackendHeadersB3Fallback(t *testing.T) {
-	badID := "550e8400-e29b-41d4-a716-446655440000" // 带横线，非法
-	req, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
-	backendHeaders(req, &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "tok"}}, &profileCN, badID, newMessageID())
-
-	if got := req.Header.Get("X-Conversation-Request-ID"); got != badID {
-		// 主键照发（上游 B3 之外的头不做 hex 校验）
-		t.Errorf("X-Conversation-Request-ID = %q, want %q", got, badID)
-	}
-	if got := req.Header.Get("X-B3-TraceId"); got == badID {
-		t.Errorf("X-B3-TraceId 不应透传非法值")
-	}
-	if !validB3TraceID(req.Header.Get("X-B3-TraceId")) {
-		t.Errorf("X-B3-TraceId 回落值非法: %q", req.Header.Get("X-B3-TraceId"))
+	if got := req.Header.Get("X-B3-TraceId"); got != "" {
+		t.Errorf("不应再发送 B3 头，实际 %q", got)
 	}
 }
 

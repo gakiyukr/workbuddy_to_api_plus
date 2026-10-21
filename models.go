@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -85,6 +86,13 @@ type catalogModel struct {
 	FromLive        bool    `json:"fromLive,omitempty"`     // 是否来自实时接口
 	MaxInputTokens  int     `json:"maxInputTokens,omitempty"`
 	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
+	MaxAllowedSize  int     `json:"maxAllowedSize,omitempty"` // 上游声明的最大允许上下文
+	// ContextLengths / ContextDefaultLength 来自上游 contextWindow：
+	// 前者是客户端可选的上下文档位，后者是客户端默认预算。
+	// 它们与「模型能力上限」（MaxInputTokens）语义不同，不能合并成一个值：
+	// 上限决定上游接受多少输入，默认预算只决定客户端自己从多少 token 开始压缩。
+	ContextLengths       []int `json:"contextLengths,omitempty"`
+	ContextDefaultLength int   `json:"contextDefaultLength,omitempty"`
 
 	// 能力旗标与推理档位：实时目录与 npm 静态目录同构下发，供 /v1/models 透出
 	// （客户端可发现上下文窗口与档位，不再盲传非法值）与请求体档位降级。
@@ -121,6 +129,39 @@ var (
 	modelsScanTrigger = make(chan struct{}, 1)
 	modelProbeTrigger = make(chan struct{}, 1)
 )
+
+// rateLogState 记录本进程已经写过的「官方倍率」日志签名。
+// 首次刷新全量记录，之后只记录发生变化的模型，避免每小时把整份目录重复写进普通日志。
+var rateLogState = struct {
+	sync.Mutex
+	seen map[string]string
+}{seen: map[string]string{}}
+
+// logOfficialRates 把官方目录取回的倍率写入普通日志，供网页控制台展示数据来源与更新时间。
+// 只记录摘要字段，不涉及任何凭据。
+func logOfficialRates(site string, models []catalogModel, refreshedAt time.Time) {
+	rateLogState.Lock()
+	defer rateLogState.Unlock()
+	changed := 0
+	for _, m := range models {
+		key := site + "|" + m.ID
+		signature := fmt.Sprintf("%s|%t|%g|%t|%s|%s", m.Credits, m.HasMultiplier, m.Multiplier, m.PromoExpired, m.PromoLabel, m.PromoUntil)
+		if previous, ok := rateLogState.seen[key]; ok && previous == signature {
+			continue
+		}
+		rateLogState.seen[key] = signature
+		changed++
+		source := "npm/缓存"
+		if m.FromLive {
+			source = "实时接口"
+		}
+		log.Printf("[Models] 官方倍率 站点=%s 模型=%s 原始credits=%q 生效倍率=%s 有倍率=%t 促销=%q 促销截止=%q 促销已过期=%t 来源=%s 刷新时间=%s",
+			site, m.ID, m.Credits, fmt.Sprintf("%.2f", m.Multiplier), m.HasMultiplier, m.PromoLabel, m.PromoUntil, m.PromoExpired, source, refreshedAt.Format("2006-01-02T15:04:05"))
+	}
+	if changed > 0 {
+		log.Printf("[Models] 官方倍率已记录：站点=%s 本轮新增或变化=%d 说明=未变化的模型不重复写日志", site, changed)
+	}
+}
 
 func probeKey(site, model string) string {
 	return site + "|" + normalizeModelName(model)
@@ -181,6 +222,11 @@ type liveCatalogData struct {
 			DefaultEffort    string   `json:"defaultEffort"`
 			SupportedEfforts []string `json:"supportedEfforts"`
 		} `json:"reasoning"`
+		MaxAllowedSize int `json:"maxAllowedSize"`
+		ContextWindow  *struct {
+			SupportedLengths []int `json:"supportedLengths"`
+			DefaultLength    int   `json:"defaultLength"`
+		} `json:"contextWindow"`
 	} `json:"models"`
 	ModelPromotions []livePromotion `json:"modelPromotions"`
 }
@@ -314,6 +360,12 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 			SupportedEfforts: m.Reasoning.SupportedEfforts,
 			DefaultEffort:    m.Reasoning.DefaultEffort,
 		}
+		var lengths []int
+		var defaultLength int
+		if m.ContextWindow != nil {
+			lengths, defaultLength = m.ContextWindow.SupportedLengths, m.ContextWindow.DefaultLength
+		}
+		applyCatalogCapability(&entry, m.MaxAllowedSize, lengths, defaultLength)
 		if s, ok := m.Credits.(string); ok {
 			entry.Credits = strings.TrimSpace(s)
 		}
@@ -350,17 +402,36 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 // -----------------------------------------------------------------------------
 
 func fetchNPMCatalogVersion() (string, error) {
+	traceID := newTraceID()
+	log.Printf("[模型目录] traceId=%s 来源=npm 阶段=版本查询开始 镜像数=%d", traceID, len(npmBases))
 	var lastErr error
 	for _, base := range npmBases {
-		resp, err := cfg.HttpClient.Get(base + "/latest")
-		if err != nil {
-			lastErr = err
+		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, base+"/latest", nil)
+		if reqErr != nil {
+			cancel()
+			lastErr = reqErr
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 阶段=创建请求 结果=失败 原因=%v", traceID, base, reqErr)
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp, err := cfg.HttpClient.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = err
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 阶段=外部请求 结果=失败 原因=%v", traceID, base, err)
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
+		if readErr != nil {
+			lastErr = readErr
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 状态码=%d 阶段=读取响应 结果=失败 原因=%v", traceID, base, resp.StatusCode, readErr)
+			continue
+		}
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 结果=失败 原因=%v", traceID, base, lastErr)
 			continue
 		}
 		var m struct {
@@ -368,10 +439,13 @@ func fetchNPMCatalogVersion() (string, error) {
 		}
 		if err := json.Unmarshal(body, &m); err != nil || strings.TrimSpace(m.Version) == "" {
 			lastErr = fmt.Errorf("manifest 缺少 version")
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 阶段=解析版本 结果=失败 原因=%v", traceID, base, lastErr)
 			continue
 		}
+		log.Printf("[模型目录] traceId=%s 来源=npm 结果=成功 版本=%s 说明=响应体已读取并关闭，再释放请求上下文", traceID, strings.TrimSpace(m.Version))
 		return strings.TrimSpace(m.Version), nil
 	}
+	log.Printf("[模型目录] traceId=%s 来源=npm 结果=查询失败 原因=%v 业务影响=继续由现有目录兜底逻辑处理", traceID, lastErr)
 	return "", lastErr
 }
 
@@ -385,6 +459,11 @@ func parseNPMCatalog(data []byte) ([]catalogModel, error) {
 			MaxOutputTokens int    `json:"maxOutputTokens"`
 			SupportsImages  bool   `json:"supportsImages"`
 			SupportsTool    bool   `json:"supportsToolCall"`
+			MaxAllowedSize  int    `json:"maxAllowedSize"`
+			ContextWindow   *struct {
+				SupportedLengths []int `json:"supportedLengths"`
+				DefaultLength    int   `json:"defaultLength"`
+			} `json:"contextWindow"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
@@ -401,13 +480,19 @@ func parseNPMCatalog(data []byte) ([]catalogModel, error) {
 			continue
 		}
 		seen[id] = true
-		// 能力字段（上下文窗口/输出上限/多模态/工具调用）与实时目录同构下发，
-		// 实时接口不可用时这些是唯一的窗口来源——丢弃会让 /v1/models 缺字段。
 		entry := catalogModel{
 			ID: id, Name: strings.TrimSpace(m.Name),
 			MaxInputTokens: m.MaxInputTokens, MaxOutputTokens: m.MaxOutputTokens,
 			SupportsImages: m.SupportsImages, SupportsToolCall: m.SupportsTool,
 		}
+		// npm 目录同样带 maxInputTokens/maxOutputTokens/contextWindow；
+		// 此前只读 id/name/credits，能力信息被整段丢弃，这里补齐。
+		var lengths []int
+		var defaultLength int
+		if m.ContextWindow != nil {
+			lengths, defaultLength = m.ContextWindow.SupportedLengths, m.ContextWindow.DefaultLength
+		}
+		applyCatalogCapability(&entry, m.MaxAllowedSize, lengths, defaultLength)
 		if s, ok := m.Credits.(string); ok {
 			entry.Credits = strings.TrimSpace(s)
 		}
@@ -444,7 +529,13 @@ func fetchNPMCatalog(version, file string) ([]catalogModel, string, error) {
 }
 
 func fetchNPMCatalogJSON(url string) ([]catalogModel, error) {
-	resp, err := cfg.HttpClient.Get(url)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +582,13 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 }
 
 func fetchNPMCatalogTarball(url, file string) ([]catalogModel, error) {
-	resp, err := cfg.HttpClient.Get(url)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -528,22 +625,90 @@ func fetchNPMCatalogTarball(url, file string) ([]catalogModel, error) {
 	}
 }
 
-// mergeCatalogs 合并两份目录：实时接口优先，npm 仅补齐接口没有的模型。
-func mergeCatalogs(live, npm []catalogModel) []catalogModel {
-	out := make([]catalogModel, 0, len(live)+len(npm))
-	seen := map[string]bool{}
-	for _, m := range live {
-		if seen[m.ID] {
+// normalizeContextLengths 过滤非法档位并按升序去重。
+// 超过模型能力上限的档位不可信（客户端也据此过滤），直接丢弃。
+func normalizeContextLengths(values []int, ceiling int) []int {
+	seen := map[int]bool{}
+	out := make([]int, 0, len(values))
+	for _, v := range values {
+		if v <= 0 || seen[v] {
 			continue
 		}
-		seen[m.ID] = true
+		if ceiling > 0 && v > ceiling {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// applyCatalogCapability 把目录里的能力字段写进条目。
+// 能力上限优先取 maxInputTokens，缺失时回落到上游声明的 maxAllowedSize；
+// 档位与默认预算只在可信时保留，绝不编造默认值。
+func applyCatalogCapability(entry *catalogModel, maxAllowed int, lengths []int, defaultLength int) {
+	if entry == nil {
+		return
+	}
+	if maxAllowed > 0 {
+		entry.MaxAllowedSize = maxAllowed
+	}
+	ceiling := entry.MaxInputTokens
+	if ceiling <= 0 {
+		ceiling = entry.MaxAllowedSize
+	}
+	if normalized := normalizeContextLengths(lengths, ceiling); len(normalized) >= 2 {
+		entry.ContextLengths = normalized
+	}
+	if defaultLength > 0 {
+		if ceiling > 0 && defaultLength > ceiling {
+			defaultLength = ceiling
+		}
+		entry.ContextDefaultLength = defaultLength
+	}
+}
+
+// backfillCapability 只用次要来源补齐缺失的能力字段；已有值永远不被覆盖。
+func backfillCapability(dst *catalogModel, src catalogModel) {
+	if dst == nil {
+		return
+	}
+	if dst.MaxInputTokens <= 0 {
+		dst.MaxInputTokens = src.MaxInputTokens
+	}
+	if dst.MaxOutputTokens <= 0 {
+		dst.MaxOutputTokens = src.MaxOutputTokens
+	}
+	if dst.MaxAllowedSize <= 0 {
+		dst.MaxAllowedSize = src.MaxAllowedSize
+	}
+	if len(dst.ContextLengths) == 0 {
+		dst.ContextLengths = append([]int(nil), src.ContextLengths...)
+	}
+	if dst.ContextDefaultLength <= 0 {
+		dst.ContextDefaultLength = src.ContextDefaultLength
+	}
+}
+
+// mergeCatalogs 合并两份目录：实时接口优先，npm 仅补齐接口没有的模型。
+// 同一模型两边都有时，用 npm 补齐实时目录缺失的能力字段（不覆盖实时值）。
+func mergeCatalogs(live, npm []catalogModel) []catalogModel {
+	out := make([]catalogModel, 0, len(live)+len(npm))
+	index := map[string]int{}
+	for _, m := range live {
+		if _, ok := index[m.ID]; ok {
+			continue
+		}
+		index[m.ID] = len(out)
 		out = append(out, m)
 	}
 	for _, m := range npm {
-		if seen[m.ID] {
+		if i, ok := index[m.ID]; ok {
+			backfillCapability(&out[i], m)
 			continue
 		}
-		seen[m.ID] = true
+		index[m.ID] = len(out)
 		out = append(out, m)
 	}
 	return out
@@ -582,6 +747,23 @@ func loadModelsCache() {
 	for key, models := range validated {
 		log.Printf("[Models] 已加载站点目录缓存：站点=%s，模型数=%d", key, len(models))
 	}
+	// 缓存里的探测结论同样写入普通日志：网页控制台据此说明「收费(倍率未知)」的来源与时间。
+	// 明确标注为缓存载入，避免被误读成本轮新探测。
+	for key, probe := range cache.Probes {
+		if probe.Verdict == "" {
+			continue
+		}
+		site, model, found := strings.Cut(key, "|")
+		if !found || site == "" || model == "" {
+			continue
+		}
+		probeTime := "未知"
+		if probe.LastProbeAt > 0 {
+			probeTime = time.Unix(probe.LastProbeAt, 0).Format("2006-01-02T15:04:05")
+		}
+		log.Printf("[ModelPrice] 载入缓存结论 站点=%s 模型=%s 判定=%s credit=%s tokens=%d 探测时间=%s 说明=%s 来源=缓存文件（非本轮新探测）",
+			site, model, probe.Verdict, formatQuota(probe.Credit), probe.Tokens, probeTime, probe.Detail)
+	}
 }
 
 func saveModelsCache(source string, catalogs map[string][]catalogModel, probes map[string]modelPriceProbe) error {
@@ -599,10 +781,12 @@ func saveModelsCache(source string, catalogs map[string][]catalogModel, probes m
 	return os.Rename(tmp, modelsCacheFile)
 }
 
-func persistModelsLocked(source string) {
-	if err := saveModelsCache(source, catalogModels, modelProbes); err != nil {
+func persistModelsLocked(source string) error {
+	err := saveModelsCache(source, catalogModels, modelProbes)
+	if err != nil {
 		log.Printf("[Models] 缓存写入失败: %v", err)
 	}
+	return err
 }
 
 func catalogSnapshot() (map[string][]catalogModel, string) {
@@ -624,15 +808,24 @@ func catalogSnapshot() (map[string][]catalogModel, string) {
 // 列表即可。额外模型没有目录条目（无窗口/能力/档位声明），按「未声明即省略」
 // 的既有纪律以裸条目透出，不编造能力字段。
 func mergedModelIDs() ([]string, string) {
+	return collectModelIDs(false)
+}
+
+func collectModelIDs(includeDisabled bool) ([]string, string) {
 	catalogs, source := catalogSnapshot()
 	seen := map[string]bool{}
 	ids := make([]string, 0, 64)
 	for _, site := range catalogSites {
 		for _, m := range catalogs[site] {
-			if !seen[m.ID] {
-				seen[m.ID] = true
-				ids = append(ids, m.ID)
+			if seen[m.ID] {
+				continue
 			}
+			// 被配置禁用的模型不出现在任何模型列表（/v1/models、monitor 统计表、health 计数）。
+			if disabled, _ := modelDisabled(m.ID); disabled && !includeDisabled {
+				continue
+			}
+			seen[m.ID] = true
+			ids = append(ids, m.ID)
 		}
 	}
 	for _, extra := range cfg.ExtraModels {
@@ -655,6 +848,136 @@ func modelEntry(site, modelID string) (catalogModel, bool) {
 		}
 	}
 	return catalogModel{}, false
+}
+
+// modelCapabilitySite 是单个站点对某模型声明的能力。
+type modelCapabilitySite struct {
+	Ceiling   int   `json:"context_length,omitempty"`         // 能力上限（maxInputTokens，缺失回落 maxAllowedSize）
+	MaxOutput int   `json:"max_output_tokens,omitempty"`      // 输出上限
+	Default   int   `json:"default_context_length,omitempty"` // 客户端默认预算（不是能力上限）
+	Options   []int `json:"context_length_options,omitempty"` // 客户端可选档位
+}
+
+// modelCapability 是 /v1/models 对外暴露的能力汇总。
+// 只有各站点一致（或仅一个站点有可信数据）时才填顶层标量；
+// 站点之间有差异时顶层留空并填 BySite，避免下游按较大值预留上下文。
+type modelCapability struct {
+	Ceiling   int
+	MaxOutput int
+	Default   int
+	Options   []int
+	BySite    map[string]modelCapabilitySite
+}
+
+func sameIntSlice(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// capabilityScalar 判断某标量能力在各站点是否一致。
+// 任一站点缺该值即视为「不可保证」，返回 false（未知不能冒充一致）。
+func capabilityScalar(bySite map[string]modelCapabilitySite, pick func(modelCapabilitySite) int) (int, bool) {
+	value, found := 0, false
+	for _, site := range catalogSites {
+		v, ok := bySite[site]
+		if !ok {
+			continue
+		}
+		got := pick(v)
+		if got <= 0 {
+			return 0, false
+		}
+		if found && got != value {
+			return 0, false
+		}
+		value, found = got, true
+	}
+	return value, found
+}
+
+func capabilityOptions(bySite map[string]modelCapabilitySite) ([]int, bool) {
+	var first []int
+	for _, site := range catalogSites {
+		v, ok := bySite[site]
+		if !ok {
+			continue
+		}
+		if len(v.Options) == 0 {
+			return nil, false
+		}
+		if first == nil {
+			first = v.Options
+			continue
+		}
+		if !sameIntSlice(first, v.Options) {
+			return nil, false
+		}
+	}
+	return first, len(first) >= 2
+}
+
+// modelCapabilityFor 汇总各站点目录中该模型的能力信息。
+//
+// 同名模型可能由国内／国际账号分别服务，能力不一定相同。这里不取最大值：
+// 顶层标量只在各站点一致时给出，否则置空并把分站点明细放进 BySite，
+// 由调用方决定如何展示。完全没有可信数据的模型返回 false，由调用方省略字段。
+func modelCapabilityFor(modelID string) (modelCapability, bool) {
+	modelsMu.RLock()
+	defer modelsMu.RUnlock()
+	modelID = normalizeModelName(modelID)
+	bySite := map[string]modelCapabilitySite{}
+	for _, site := range catalogSites {
+		for _, m := range catalogModels[site] {
+			if m.ID != modelID {
+				continue
+			}
+			ceiling := m.MaxInputTokens
+			if ceiling <= 0 {
+				ceiling = m.MaxAllowedSize
+			}
+			site0 := modelCapabilitySite{
+				Ceiling: ceiling, MaxOutput: m.MaxOutputTokens,
+				Default: m.ContextDefaultLength, Options: append([]int(nil), m.ContextLengths...),
+			}
+			if site0.Ceiling <= 0 && site0.MaxOutput <= 0 && site0.Default <= 0 && len(site0.Options) == 0 {
+				break // 该站点没有可信能力数据，不参与汇总
+			}
+			bySite[site] = site0
+			break
+		}
+	}
+	if len(bySite) == 0 {
+		return modelCapability{}, false
+	}
+	cap := modelCapability{}
+	cap.Ceiling, _ = capabilityScalar(bySite, func(v modelCapabilitySite) int { return v.Ceiling })
+	cap.MaxOutput, _ = capabilityScalar(bySite, func(v modelCapabilitySite) int { return v.MaxOutput })
+	cap.Default, _ = capabilityScalar(bySite, func(v modelCapabilitySite) int { return v.Default })
+	if opts, ok := capabilityOptions(bySite); ok {
+		cap.Options = opts
+	}
+	if len(bySite) > 1 {
+		// 顶层有任一字段没能统一时，给出分站点明细，避免信息丢失。
+		for _, site := range catalogSites {
+			v, ok := bySite[site]
+			if !ok {
+				continue
+			}
+			if v.Ceiling != cap.Ceiling || v.MaxOutput != cap.MaxOutput ||
+				v.Default != cap.Default || !sameIntSlice(v.Options, cap.Options) {
+				cap.BySite = bySite
+				break
+			}
+		}
+	}
+	return cap, true
 }
 
 func modelMultiplier(site, modelID string) (float64, bool) {
@@ -701,20 +1024,36 @@ func siteKnownFree(site, modelID string) bool {
 	if modelProbeVerdict(site, modelID) == "free" {
 		return true
 	}
-	accountMu.Lock()
-	now := time.Now()
-	for _, acc := range accounts {
-		if profileForEdition(acc.Auth.Edition).Key != site && acc.Edition != site {
-			continue
-		}
-		if acc.ModelStates != nil {
+	accountFree := func() (knownFree bool) {
+		accountMu.Lock()
+		skipped := 0
+		defer func() {
+			accountMu.Unlock()
+			if skipped > 0 {
+				log.Printf("[站点免费判断] 站点=%s 模型=%s 跳过不可调度账号=%d 有效账号免费记录=%t 说明=空账号、失效标记及缺少凭据的账号不参与判断",
+					site, modelID, skipped, knownFree)
+			}
+		}()
+		now := time.Now()
+		for _, acc := range accounts {
+			// 启动时会载入 .disabled 标记形成无 Auth 的占位账号；
+			// 它们不能参与调度，也不能因历史免费状态影响站点选择。
+			if acc == nil || acc.Disabled || acc.Auth == nil || acc.Auth.Auth.AccessToken == "" {
+				skipped++
+				continue
+			}
+			if acc.Profile().Key != site && acc.Edition != site {
+				continue
+			}
 			if st := acc.ModelStates[normalizeModelName(modelID)]; st != nil && modelCostTier(st, now) == 0 {
-				accountMu.Unlock()
 				return true
 			}
 		}
+		return false
+	}()
+	if accountFree {
+		return true
 	}
-	accountMu.Unlock()
 	entry, ok := modelEntry(site, modelID)
 	return ok && entry.HasMultiplier && entry.Multiplier == 0 && !entry.PromoExpired
 }
@@ -774,7 +1113,12 @@ func modelNeedsProbe(site, modelID string, requests int64) bool {
 // 同步
 // -----------------------------------------------------------------------------
 
-func refreshModelsOnce() {
+func refreshModelsOnce(schedule ...time.Time) {
+	next := time.Time{}
+	if len(schedule) > 0 {
+		next = schedule[0]
+	}
+	trace, started := startScheduledTask("model_catalog", next)
 	version, verErr := fetchNPMCatalogVersion()
 	if verErr != nil {
 		log.Printf("[Models] npm 版本查询失败（仅影响 npm 兜底来源）: %v", verErr)
@@ -823,7 +1167,30 @@ func refreshModelsOnce() {
 		}
 	}
 
+	// 能力信息覆盖情况：只在目录刷新时记录一次，不随 /v1/models 逐次打印，
+	// 便于人工核对「哪些模型有可信上下文/输出能力、哪些站点还缺」。
+	for _, site := range catalogSites {
+		models, ok := fetched[site]
+		if !ok {
+			continue
+		}
+		ceiling, options, output := 0, 0, 0
+		for _, m := range models {
+			if m.MaxInputTokens > 0 || m.MaxAllowedSize > 0 {
+				ceiling++
+			}
+			if len(m.ContextLengths) >= 2 {
+				options++
+			}
+			if m.MaxOutputTokens > 0 {
+				output++
+			}
+		}
+		log.Printf("[模型能力] traceId=%s 站点=%s 模型数=%d 有上下文上限=%d 有可选档位=%d 有输出上限=%d 说明=仅记录目录覆盖情况，不注入上游参数、不改变输出预算", trace, site, len(models), ceiling, options, output)
+	}
+
 	if len(fetched) == 0 {
+		logScheduledTask("model_catalog", "completed", "failed", trace, started, next, "两路目录都不可用，保留原状态")
 		log.Printf("[Models] 无任何可用目录数据，保留原状态；失败详情: %s", strings.Join(failures, " | "))
 		return
 	}
@@ -855,9 +1222,20 @@ func refreshModelsOnce() {
 			}
 		}
 	}
-	persistModelsLocked(source)
+	cacheErr := persistModelsLocked(source)
 	modelsMu.Unlock()
+	refreshedAt := time.Now()
+	for _, site := range catalogSites {
+		if models, ok := fetched[site]; ok && len(models) > 0 {
+			logOfficialRates(site, models, refreshedAt)
+		}
+	}
 	requestModelsProbe()
+	status := "success"
+	if len(failures) > 0 || verErr != nil || cacheErr != nil {
+		status = "partial"
+	}
+	logScheduledTask("model_catalog", "completed", status, trace, started, next, fmt.Sprintf("可用目录=%d，来源失败=%d，npm版本查询失败=%t，缓存写入失败=%t", len(fetched), len(failures), verErr != nil, cacheErr != nil))
 }
 
 func requestModelsScan() {
@@ -882,13 +1260,16 @@ func modelsRefreshLoop(interval time.Duration) {
 	refreshModelsOnce()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	next := time.Now().Add(interval)
+	logScheduledTask("model_catalog", "scheduled", "", newTraceID(), time.Time{}, next, "目录刷新完成后开始定时间隔")
 	for {
 		select {
-		case <-ticker.C:
-			refreshModelsOnce()
+		case tick := <-ticker.C:
+			next = tick.Add(interval)
+			refreshModelsOnce(next)
 		case <-modelsScanTrigger:
 			log.Printf("[Models] 账号池发生变化，立即刷新模型目录")
-			refreshModelsOnce()
+			refreshModelsOnce(next)
 		}
 	}
 }
@@ -897,8 +1278,22 @@ func modelsRefreshLoop(interval time.Duration) {
 // modelPriceProbeLoop 周期性执行价格探测。
 // 首轮在启动后很快执行；只要仍有待探测模型就用较短间隔追赶，收敛后回到长间隔。
 func modelPriceProbeLoop() {
+	trace := newTraceID()
+	if !cfg.automaticPriceProbesAllowed() {
+		reason := "默认关闭，未显式指定-allow-price-probes=true"
+		if cfg.DisablePriceProbes {
+			reason = "兼容旧参数-disable-price-probes=true，禁用优先"
+		}
+		logScheduledTask("price_probe", "disabled", "disabled", trace, time.Time{}, time.Time{}, reason+"；不会自动请求模型，不消耗后台价格探测积分")
+		log.Printf("[ModelPrice] traceId=%s 阶段=自动探测调度 allowPriceProbes=%t legacyDisablePriceProbes=%t 结果=已关闭 原因=%s 业务影响=不会自动请求模型，客户端请求、目录刷新和显式probe不受影响",
+			trace, cfg.AllowPriceProbes, cfg.DisablePriceProbes, reason)
+		return
+	}
+	log.Printf("[ModelPrice] traceId=%s 阶段=自动探测调度 allowPriceProbes=%t legacyDisablePriceProbes=%t 结果=已开启 原因=显式指定-allow-price-probes 费用警告=将发起真实模型生成请求，可能消耗积分；没有累计积分预算限制",
+		trace, cfg.AllowPriceProbes, cfg.DisablePriceProbes)
 	timer := time.NewTimer(modelPriceProbeStartDelay)
 	defer timer.Stop()
+	logScheduledTask("price_probe", "scheduled", "", trace, time.Time{}, time.Now().Add(modelPriceProbeStartDelay), "显式开启，真实请求可能消耗积分；启动后20秒首轮；无候选模型时不生成请求")
 	for {
 		select {
 		case <-timer.C:
@@ -910,6 +1305,7 @@ func modelPriceProbeLoop() {
 			next = modelPriceProbeCatchUp
 		}
 		timer.Reset(next)
+		logScheduledTask("price_probe", "scheduled", "", newTraceID(), time.Time{}, time.Now().Add(next), "按待探测情况2分钟或30分钟；同站点模型受12小时限制")
 	}
 }
 
@@ -921,6 +1317,9 @@ func modelPendingProbeCount() int {
 	for _, site := range catalogSites {
 		for _, id := range ids {
 			if !modelNeedsProbe(site, id, modelRequestCount(id)) {
+				continue
+			}
+			if pickProbeAccountForModel(site, id) == nil {
 				continue
 			}
 			modelsMu.RLock()
@@ -948,26 +1347,29 @@ func modelProbeBatchSize() int {
 }
 
 func modelPriceProbeOnce() {
+	trace, started := startScheduledTask("price_probe", time.Time{})
 	ids, _ := mergedModelIDs()
 	if len(ids) == 0 {
+		logScheduledTask("price_probe", "completed", "skipped", trace, started, time.Time{}, "目录为空，没有探测请求")
 		return
 	}
 	now := time.Now()
 	batch := modelProbeBatchSize()
 	done := 0
+	failed := 0
 	for _, site := range catalogSites {
 		if done >= batch {
 			break
-		}
-		acc := pickProbeAccount(site)
-		if acc == nil {
-			continue
 		}
 		for _, id := range ids {
 			if done >= batch {
 				break
 			}
 			if !modelNeedsProbe(site, id, modelRequestCount(id)) {
+				continue
+			}
+			acc := pickProbeAccountForModel(site, id)
+			if acc == nil {
 				continue
 			}
 			modelsMu.RLock()
@@ -985,8 +1387,11 @@ func modelPriceProbeOnce() {
 				p.Verdict = verdict
 			}
 			modelProbes[probeKey(site, id)] = p
-			persistModelsLocked(dynamicSource)
+			cacheErr := persistModelsLocked(dynamicSource)
 			modelsMu.Unlock()
+			if verdict == "" || cacheErr != nil {
+				failed++
+			}
 			log.Printf("[ModelPrice] 站点=%s 账号=%s 模型=%s -> verdict=%s credit=%s tokens=%d (%s)",
 				site, acc.Path, id, p.Verdict, formatQuota(credit), tokens, detail)
 			done++
@@ -995,6 +1400,15 @@ func modelPriceProbeOnce() {
 	if done > 0 {
 		writeStatusSnapshot()
 	}
+	status := "success"
+	if done == 0 {
+		status = "skipped"
+	} else if failed == done {
+		status = "failed"
+	} else if failed > 0 {
+		status = "partial"
+	}
+	logScheduledTask("price_probe", "completed", status, trace, started, time.Time{}, fmt.Sprintf("探测=%d，结论或缓存异常=%d", done, failed))
 }
 
 // pickProbeAccount 选择同站点账号用于价格探测。
@@ -1002,6 +1416,10 @@ func modelPriceProbeOnce() {
 // 返回 20017 无权限的账号）——探测若命中 14018 只会被忽略，不会污染判定。
 // 仅跳过「已知耗尽」与失效账号。
 func pickProbeAccount(site string) *Account {
+	return pickProbeAccountForModel(site, "")
+}
+
+func pickProbeAccountForModel(site, model string) *Account {
 	accountMu.Lock()
 	defer accountMu.Unlock()
 	var unknownQuota *Account
@@ -1012,8 +1430,12 @@ func pickProbeAccount(site string) *Account {
 		if profileForEdition(acc.Auth.Edition).Key != site {
 			continue
 		}
+		if allowed, reason := modelAccountAllowed(model, acc, accounts); !allowed {
+			log.Printf("[ModelPrice] 站点=%s 模型=%s 凭据=%s 结果=跳过 原因=账号名单%s", site, model, filepath.Base(acc.Path), reason)
+			continue
+		}
 		if acc.QuotaKnown {
-			if acc.QuotaRemaining > 0 {
+			if acc.QuotaUnlimited || acc.QuotaRemaining > 0 {
 				return acc
 			}
 			continue // 已知耗尽，跳过
@@ -1034,6 +1456,11 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	defer acc.lock.Unlock()
 
 	accountMu.Lock()
+	if allowed, reason := modelAccountAllowed(model, acc, accounts); !allowed {
+		accountMu.Unlock()
+		log.Printf("[ModelPrice] traceId=%s 模型=%s 凭据=%s 结果=跳过 原因=%s 说明=等待账号锁后重新检查热配置，未调用上游", newTraceID(), model, filepath.Base(acc.Path), reason)
+		return "", 0, 0, "账号名单排除：" + reason
+	}
 	if acc.Disabled || acc.Auth == nil {
 		accountMu.Unlock()
 		return "", 0, 0, "账号不可用"
@@ -1041,6 +1468,9 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	auth := *acc.Auth
 	prof := acc.Profile()
 	accountMu.Unlock()
+	if disabled, reason := modelDisabled(model); disabled {
+		return "", 0, 0, reason
+	}
 
 	payload, _ := json.Marshal(map[string]any{
 		"model": model, "stream": true, "max_tokens": 300,
@@ -1055,7 +1485,7 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	if err != nil {
 		return "", 0, 0, err.Error()
 	}
-	backendHeaders(req, &auth, prof, "", newMessageID())
+	backendHeaders(req, &auth, prof)
 	// 聊天端点调用：走无总时长的聊天客户端。本函数自带的 60s ctx 才是
 	// 这里的超时来源（默认客户端的 180s 总时长会让 ctx 语义变得多余且易漂移）。
 	resp, err := chatClientForAccount(acc).Do(req)

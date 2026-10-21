@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地网关 · 网页控制台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>本地网关</h1>
+    <span class="tag">网页控制台</span>
+  </div>
+  <div class="topbar-right">
+    <span class="conn" id="conn">未连接</span>
+    <div class="meta" id="meta"></div>
+    <span class="key-field">
+      <label for="apiKey">管理 Key</label>
+      <input id="apiKey" type="password" placeholder="独立管理 Key" autocomplete="off">
+    </span>
+    <button id="saveKey" type="button">登录</button>
+    <button id="logout" class="ghost" type="button">退出</button>
+    <button id="themeToggle" class="ghost" type="button" title="切换主题">主题</button>
+  </div>
+</header>
+
+<nav class="tabs hidden" id="tabs">
+  <button class="tab active" data-tab="overview" type="button">总览</button>
+  <button class="tab" data-tab="accounts" type="button">账号池</button>
+  <button class="tab" data-tab="models" type="button">模型列表</button>
+  <button class="tab" data-tab="logs" type="button">日志</button>
+  <button class="tab" data-tab="config" type="button">配置</button>
+  <button class="tab" data-tab="tasks" type="button">定时任务</button>
+  <button class="tab" data-tab="settings" type="button">访问设置</button>
+</nav>
+
+<div id="alert" class="alert hidden"></div>
+
+<section id="setupPanel" class="setup-panel card hidden">
+  <h2>首次设置管理 Key</h2>
+  <p id="setupHelp">服务器将生成一个 32 字符随机管理 Key，写入 config.json，并仅在本次操作完成后弹窗展示。请妥善保存。</p>
+  <p class="hint">两种设置方式：① 在服务器本机（或 SSH 本地端口转发）打开本页，一键生成 32 字符随机 Key；
+    ② 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串，保存后约 1 秒生效。
+    自动生成仅限本机，避免远程抢先初始化；设置完成后可从其他设备使用管理 Key 登录。</p>
+  <button id="initializeAdmin" type="button">生成并保存管理 Key</button>
+</section>
+
+<main id="dashboard" class="hidden">
+  <section id="panel-overview" class="panel active">
+    <h2 class="overview-subheading">运行状态</h2>
+    <div class="health-layout">
+      <section class="card health-card" aria-labelledby="healthTitle">
+        <h3 class="card-title" id="healthTitle">账号池健康度</h3>
+        <div id="poolHealth" class="health-value" role="status" aria-live="polite">—</div>
+        <div class="health-track" aria-hidden="true"><div id="poolHealthBar"></div></div>
+        <p id="poolHealthStatus" class="health-status">等待账号状态</p>
+        <p class="hint">可用且未停用的账号占全部账号的比例。全部可用为 100%；无账号或快照失效时显示未知。</p>
+        <p class="hint health-footnote">账号级健康度，不代表每个模型都可调用。</p>
+      </section>
+      <section class="card account-alert-card" aria-labelledby="accountAlertsTitle">
+        <div class="card-title"><h3 id="accountAlertsTitle">账号日志告警</h3><span class="badge">只读日志</span></div>
+        <p id="accountAlertsInfo" class="hint" role="status" aria-live="polite">登录后读取账号异常日志。</p>
+        <div id="accountAlerts" class="account-alert-list" tabindex="0" aria-label="账号异常告警列表">
+          <p class="stats-empty">等待日志</p>
+        </div>
+      </section>
+    </div>
+    <section class="usage-section" aria-labelledby="usageTitle">
+      <div class="usage-heading">
+        <div><h2 id="usageTitle">用量与性能</h2><p class="hint">按凭据汇总实际 Token 与积分消耗 · UTC+8</p></div>
+        <span id="statsStorage" class="badge" role="status">等待统计</span>
+      </div>
+      <div class="stats-controls">
+        <label>统计粒度<select id="statsPeriod"><option value="hour">小时</option><option value="day" selected>日</option><option value="week">周</option><option value="month">月</option></select></label>
+        <label class="stats-account">统计范围<select id="statsAccount"><option value="">全局 · 全部账号</option></select></label>
+        <label>开始日期<input id="statsStart" type="date"></label>
+        <label>结束日期<input id="statsEnd" type="date"></label>
+        <button id="statsApply" type="button">查询</button>
+      </div>
+      <p id="statsFilterStatus" class="hint hidden" role="status"></p>
+      <p id="statsInfo" class="hint" role="status" aria-live="polite">登录后加载统计。没有历史数据时不会补造记录。</p>
+      <div id="usageSummary" class="usage-cards"></div>
+      <div class="usage-charts">
+        <div class="card chart-card">
+          <div class="card-title">用量趋势 <span class="chart-legend"><i class="series-dot token"></i>总 Token（折线·左轴） <i class="series-dot credit"></i>积分（柱形·右轴）</span></div>
+          <p class="hint">总 Token 用折线、积分用柱形，放在同一张图里对照；两者量级差很多，分别看左右两侧刻度。某个时间桶没有样本时不画点、不补 0。</p>
+          <div id="usageChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
+        </div>
+        <div class="card chart-card latency-chart">
+          <div class="card-title">请求耗时趋势 <span id="latencyLegend" class="chart-legend"></span></div>
+          <p class="hint">柱形是首 Token，折线是总耗时，同一张图里对照。每条柱、每条线都属于一个模型，不会把不同模型合成一条平均线；该模型在某个时间桶没有样本时柱和线都断开，不画成 0。</p>
+          <div id="latencyChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">模型用量排名 <span id="statsRange" class="hint"></span></div>
+        <p class="hint">跟随上方时间范围与账号选择；只列出有调用的模型，用量（Token）多的排前面，Token 未知时按请求数排。</p>
+        <div class="table-wrap"><table id="statsTable">
+          <thead><tr><th>#</th><th>模型</th><th>请求</th><th>完整 / 失败</th><th>总 Token</th><th>输入 / 输出</th><th>缓存读取</th><th>积分</th><th>平均总耗时</th><th>平均首Token</th><th>数据覆盖</th></tr></thead>
+          <tbody><tr><td colspan="11" class="empty">等待统计</td></tr></tbody>
+        </table></div>
+      </div>
+    </section>
+    <div class="card">
+      <div class="card-title">运行信息</div>
+      <div class="kv" id="gatewayInfo"></div>
+    </div>
+  </section>
+
+  <section id="panel-accounts" class="panel">
+    <div class="card">
+      <div class="card-title">
+        账号池
+        <span class="filter">
+          <label title="只显示状态为可用且全局调度开启的账号"><input type="checkbox" id="onlyUsableAccounts"> 只显示可用账号</label>
+        </span>
+      </div>
+      <p class="hint">调度开关写入 models.accounts.all.blocklist 并立即生效。已有全局白名单时，首次操作会删除 all.allowlist，将当前账号池启停状态转为黑名单；之后新增账号默认开启。停用不删除凭据、不清除账本、不打断已有请求，开启后仍受模型专属规则限制。</p>
+      <p id="accountFilterStatus" class="hint hidden" role="status"></p>
+      <div class="account-toolbar">
+        <button id="addAccountBtn" type="button">添加账号</button>
+        <span id="addAccountHint" class="hint">凭据直接写入程序运行目录，无需手工放置文件。</span>
+      </div>
+      <section id="addAccountPanel" class="add-account-panel hidden" aria-labelledby="addAccountTitle">
+        <h3 id="addAccountTitle">添加账号</h3>
+        <div class="add-account-form">
+          <label>站点
+            <select id="addSite">
+              <option value="cn">国内站</option>
+              <option value="intl">国际站</option>
+            </select>
+          </label>
+          <label>凭据名
+            <span class="path-prefix">运行目录 /</span>
+            <input id="addFile" type="text" autocomplete="off" spellcheck="false">
+          </label>
+          <button id="addStart" type="button">获取登录接口</button>
+          <button id="addCancel" class="ghost" type="button">关闭</button>
+        </div>
+        <p id="addAccountStatus" class="hint" role="status" aria-live="polite"></p>
+        <div id="addAccountResult" class="add-account-result hidden">
+          <img id="addAccountQr" alt="登录二维码" width="240" height="240">
+          <div>
+            <p class="hint">用手机扫码完成授权。无法扫码时，可在浏览器里直接打开下面这个链接：</p>
+            <p class="hint add-account-link-row">
+              <a id="addAccountLink" href="#" target="_blank" rel="noreferrer"></a>
+              <button id="addAccountCopy" class="ghost" type="button" disabled>复制链接</button>
+            </p>
+          </div>
+        </div>
+      </section>
+      <div class="table-wrap">
+        <table id="accountsTable">
+          <thead>
+            <tr>
+              <th>#</th><th>全局调度</th><th>凭据文件</th><th>账号</th><th>站点</th><th>状态</th>
+              <th>Token 有效期</th><th>总额度</th><th>已用</th><th>剩余</th>
+              <th>套餐</th><th>免费模型</th><th>模型冷却</th>
+              <th>上次续期</th><th>续期失败</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-models" class="panel">
+    <div class="card">
+      <div class="card-title">
+        模型列表
+        <span class="filter">
+          <label title="只显示已启用且可用账号数大于 0 的模型"><input type="checkbox" id="onlyUsable"> 只显示可用模型</label>
+        </span>
+      </div>
+      <p class="hint" id="modelPolicyHint">模型开关写入 models.blocklist 并立即生效；停用模型仍保留在此列表，客户端模型目录会隐藏停用项。</p>
+      <p class="hint">请求、平均首Token、平均总耗时和总Token 取自 stats.json 的近 5 小时；启用状态、倍率、可用账号与末次状态取自状态快照。</p>
+      <p id="modelFilterStatus" class="hint hidden" role="status"></p>
+      <div class="table-wrap">
+        <table id="modelsTable">
+          <thead>
+            <tr>
+              <th>启用</th><th>模型</th><th>国内倍率</th><th>国际倍率</th><th>可用账号</th>
+              <th title="来自 stats.json 的近 5 小时窗口">请求(5h)</th><th title="网关请求入口到首个有效内容增量，心跳和角色声明不计；仅完整步骤；来自 stats.json 的近 5 小时窗口">平均首Token(5h)</th><th title="来自 stats.json 的近 5 小时窗口">平均总耗时(5h)</th><th title="来自 stats.json 的近 5 小时窗口">总Token(M, 5h)</th><th>末次状态</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-logs" class="panel">
+    <div class="card settings-card">
+      <div class="card-title">日志保留与清理</div>
+      <p class="hint">0 表示保留全部；7 表示保留今天及此前 6 天。保存会写入 config.json 并自动清理过期日志，删除不可撤销。只处理项目日志，不删除配置或凭据。</p>
+      <div class="settings-row">
+        <label for="logRetentionDays">日志保留天数</label>
+        <input id="logRetentionDays" type="number" min="0" max="36500" step="1" value="0">
+      </div>
+      <div class="actions">
+        <button id="saveLogSettings" type="button">保存保留天数</button>
+        <button id="cleanupLogs" type="button" class="ghost">立即清理过期日志</button>
+      </div>
+      <p id="logCleanupResult" class="hint action-result" role="status"></p>
+    </div>
+    <div class="card">
+      <div class="card-title">
+        运行日志
+        <span class="filter">
+          <select id="logFile"></select>
+          <select id="logLines">
+            <option value="100">100 行</option>
+            <option value="200" selected>200 行</option>
+            <option value="500">500 行</option>
+            <option value="1000">1000 行</option>
+          </select>
+        </span>
+      </div>
+      <pre class="logbox" id="logBox">加载中…</pre>
+    </div>
+  </section>
+
+  <section id="panel-config" class="panel">
+    <div class="card">
+      <div class="card-title">
+        <span id="configTitle">config.json（预览 · Key 已隐藏）</span>
+        <button id="editConfig" type="button">编辑配置</button>
+      </div>
+      <p class="hint">保存等效于直接修改服务器 config.json。预览始终隐藏 Key；确认编辑警告后才加载含真实 Key 的原文。</p>
+      <div id="configWarning" class="config-warning hidden" role="region" aria-labelledby="configWarningTitle">
+        <h2 id="configWarningTitle">编辑前请确认风险</h2>
+        <ul>
+          <li>这是整份服务器配置，不是副本。编辑器会显示真实管理 Key 和 API Key，请勿分享截图或在公共设备上编辑；仅通过可信网络、HTTPS 或 SSH 转发访问，建议先自行备份。</li>
+          <li>保存后，密钥、模型/账号规则、提示词等立即生效。端口修改需重启服务；API 端口仍可能受启动参数 <code>-port</code> 覆盖。</li>
+          <li>修改管理 Key 会要求重新登录；清空它将使管理登录不可用，需在服务器本机重新设置。</li>
+          <li>改变日志保留天数可能触发过期日志删除，删除不可撤销。错误的配置会被拒绝，不写入文件。</li>
+        </ul>
+        <div class="actions">
+          <button id="acknowledgeConfigEdit" type="button">我已了解风险，加载并编辑</button>
+          <button id="cancelConfigWarning" class="ghost" type="button">返回预览</button>
+        </div>
+      </div>
+      <pre class="logbox" id="configBox">加载中…</pre>
+      <div id="configEditorPanel" class="hidden">
+        <p class="config-sensitive">编辑中 · 包含真实 Key，仅保留在当前页面内存中。离开配置页或退出编辑会清除原文。</p>
+        <label for="configEditor" class="hint">完整配置 JSON</label>
+        <textarea id="configEditor" class="config-editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="configEditorStatus"></textarea>
+        <p id="configEditorStatus" class="hint action-result" role="status" aria-live="polite"></p>
+        <div class="actions">
+          <button id="saveConfig" type="button">校验并保存</button>
+          <button id="reloadConfigEditor" class="ghost" type="button">重新加载</button>
+          <button id="cancelConfigEdit" class="ghost" type="button">退出编辑</button>
+        </div>
+      </div>
+      <p id="configResult" class="hint action-result" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <section id="panel-tasks" class="panel">
+    <div class="card">
+      <div class="card-title">定时任务时间 <span class="badge">只读 · 后端日志</span></div>
+      <p class="hint">不修改任务，也不触发执行。上次执行与结果来自当前服务进程日志；下次时间为定时计划，事件触发可能提前。高频检查每60秒汇总最近一次执行，状态变化即时记录。</p>
+      <p id="tasksInfo" class="hint" role="status">加载任务日志…</p>
+      <div class="table-wrap"><table id="tasksTable">
+        <thead><tr><th>任务</th><th>启用</th><th>执行周期</th><th>上次执行记录</th><th>上次完成</th><th>执行结果</th><th>下次预计执行</th><th>日志说明</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section id="panel-settings" class="panel">
+    <div class="card settings-card">
+      <div class="card-title">访问与端口设置</div>
+      <p class="hint">这里只控制模型 API。管理 Key 始终需要验证，与本开关无关。</p>
+      <div class="settings-row">
+        <label for="apiKeyEnabled"><input id="apiKeyEnabled" type="checkbox"> 开启模型 API Key 校验</label>
+      </div>
+      <div class="settings-row">
+        <label for="modelAPIKey">模型 API Key</label>
+        <input id="modelAPIKey" type="password" autocomplete="new-password" placeholder="开启校验时必须设置；已有 Key 可留空保留">
+        <span id="apiKeyState" class="hint"></span>
+      </div>
+      <p class="hint">关闭时，客户端不带 Key 或使用任意 Key 均可调用模型。开启时必须匹配已保存的 API Key；保存后立即生效，已有流式请求不被主动中断。</p>
+      <button id="saveAPISettings" type="button">保存 API 访问设置</button>
+      <div class="settings-ports">
+        <div>API 监听端口：<strong id="apiPortValue">-</strong></div>
+        <div>Web 监听端口：<strong id="webPortValue">-</strong></div>
+        <div class="port-inputs">
+          <div class="settings-row"><label for="configuredApiPort">配置 API 端口</label><input id="configuredApiPort" type="number" min="1" max="65535" step="1"></div>
+          <div class="settings-row"><label for="configuredWebPort">配置 Web 端口</label><input id="configuredWebPort" type="number" min="1" max="65535" step="1"></div>
+        </div>
+        <p id="portSettingsStatus" class="hint" role="status">保存等效于修改 config.json 的 gateway.apiPort / gateway.webPort，重启网关后改变监听；不会中断当前页面和流式请求。</p>
+        <button id="savePortSettings" type="button">保存端口配置</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

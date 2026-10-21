@@ -3,7 +3,9 @@
 <img width="917" height="754" alt="image" src="https://github.com/user-attachments/assets/7dcfc461-1357-4991-9565-279047687898" />
 
 
-基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制。
+基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。支持 CLI 与可选的 Web 控制台（`-webui`，管理 Key / 端口 / 模型 API 鉴权由 `config.json` 配置），登录、凭据续期、账号与模型管理均可在命令行或网页完成。
+
+> **合并说明（2026-10-21）**：本仓库已合并上游 [CangShui/workbuddy-gateway](https://github.com/CangShui/workbuddy-gateway) **v1.14.21** 的全部功能，包括 Web 控制台、`config.json` 热加载、Anthropic Messages API（`/v1/messages`）、用量统计与账号告警、凭据保活与删除前校验、模型/账号黑白名单、完整请求诊断、官方会话头族与 DeepSeek Harness 前缀净化等。上游完整使用手册见 [`docs/user-guide.md`](docs/user-guide.md)；本文件保留本 fork 的串行调度、错误分类、成本账本与移植来源说明。
 
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
@@ -228,6 +230,20 @@
 
 ---
 
+## 上游 v1.14.21 合并功能
+
+- **Web 控制台**：`-webui` 启用独立管理端口（默认 `8316`），查看总览、账号、模型、日志、配置与凭据（脱敏），支持网页新增/删除账号、切换模型与账号规则、保存日志保留天数与模型 API 鉴权；管理 Key 与端口由 `config.json` 的 `gateway` 段配置。
+- **`config.json` 热加载**：模型黑白名单、按模型限制账号文件、`systemPrompt.fallback/force`、`debug.enabled/fullRequests`、`logs.retentionDays`、`upstream` 超时与重试均在 1 秒内生效；端口变更需重启。
+- **Anthropic Messages API**：`/v1/messages` 与 `/v1/messages/count_tokens`，兼容 `x-api-key`，Claude Code 等客户端可直连。
+- **用量与健康**：`stats.json` 持久化用量/耗时统计，账号健康告警内联到快照，网页总览展示柱线图与告警。
+- **凭据安全**：覆盖/删除前只读校验；主动保活 `-keepalive-hours`（默认每天 22:00）；连续失败阈值、刷新令牌到期展示。
+- **请求诊断**：结构化 JSON 调试日志；`debug.fullRequests` 可记录入站/出站完整请求（凭据脱敏，正文仍属敏感数据）。
+- **11128 渠道校验修复**：出站恒发官方语义的 `X-Conversation-ID` / `-Request-ID` / `-Message-ID`；system 开头的 DeepSeek Harness 身份句做偏移 0 等义改写。
+- **模型/账号规则**：`models.blocklist` / `allowlist`；`models.accounts` 支持 `all` 与按模型指定凭据文件黑白名单。
+- **构建矩阵**：Windows/Linux/macOS 的 x86、x64、ARM、ARM64 产物与 SHA256 清单。
+
+完整配置、网页操作、超时与诊断说明见 [`docs/user-guide.md`](docs/user-guide.md)。
+
 ## 命令总览
 
 ```text
@@ -253,10 +269,15 @@ workbuddy-gateway [command] [options]
 | `-port <port>` | `8317` | 网关监听端口 |
 | `-auth <path>` | 自动发现 | 凭据文件路径，支持逗号分隔多个 |
 | `-auth-dir <dir>` | 空 | 凭据目录，自动加载目录内所有 `workbuddy*.json` |
-| `-api-key <key>` | 空 | 设置后调用网关必须携带 `Authorization: Bearer <key>` |
+| `-api-key <key>` | 空 | 旧启动方式兼容：显式传入时覆盖 `config.json` 的 `gateway.apiKey` 并启用鉴权 |
 | `-proxy <url>` | 空 | 上游请求代理，如 `http://127.0.0.1:7890`、`socks5://...` |
 | `-verbose` | `false` | 输出详细调试日志 |
 | `-intl` | `false` | 仅 `login` 生效：登录国际站 |
+| `-webui` | `false` | 启用独立 Web 控制台（默认 `http://<addr>:8316/ui/`） |
+| `-allow-price-probes` | `false` | 开启后台自动价格探测（会发真实生成请求，可能消耗积分） |
+| `-keepalive-hours <h,h,...>` | `22` | 主动续期时刻；留空关闭 |
+| `-prompt-mode <mode>` | `passthrough` | `passthrough` / `custom` / `append` |
+| `-prompt-text <text>` | 空 | `custom` / `append` 模式的网关提示词 |
 | `-reload-interval <sec>` | `5` | 凭据热加载扫描间隔，`0` 关闭 |
 | `-models-refresh <min>` | `60` | 模型目录刷新间隔，`0` 关闭 |
 | `-cost-explore-interval <dur>` | `30m` | costTier 条件探索窗口，`0` 关停 |

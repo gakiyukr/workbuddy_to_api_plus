@@ -18,7 +18,6 @@
 ## WorldofPlainness
 
 - GitHub: https://github.com/WorldofPlainness （亦使用 `Cooky0606` 提交）
-- 邮箱: yl-77@qq.com
 - 提议: https://github.com/CangShui/workbuddy-gateway/pull/3
 - 标题: `fix: normalize empty finish_reason in upstream stream chunks`
 - 采纳内容: 上游在每个流式分片都下发 `finish_reason:""`，而 OpenAI 规范要求中间分片为
@@ -29,6 +28,37 @@
 - 落地方式: 按原方案应用，包含作者提供的 `stream_test.go`（分片归一化、空壳清除、
   走真实 `handleChatCompletions` 的端到端用例）。
 - 关联版本: v1.11.0 起
+
+## xiangshui001
+
+- GitHub: https://github.com/xiangshui001
+- 提议: https://github.com/CangShui/workbuddy-gateway/pull/11
+- 标题: `fix: 加固本地网关鉴权、凭据保护与请求边界`
+- 采纳内容:
+  - 修复 npm 模型目录版本查询在响应体读取完成前取消请求上下文的问题。
+  - 隐藏启动横幅中的 API Key。
+  - 使用常量时间比较 API Key，保留本仓库原有的 Bearer、`x-api-key` 提取与回退行为。
+  - 修正只读凭据校验：普通 HTTP 403 不直接确认 Token 失效；其他账号停用规则保持不变。
+  - 凭据写入成功后再更新 `currAuth`，保留现有文件写入方式。
+  - 采用日志秘密值脱敏的方向，按本仓库需求调整实现，保留错误码、失败原因与 TraceID；
+    不改写用于业务判断的原始错误或客户端错误响应。
+- 落地方式: 以当前代码为基线手工摘取兼容性风险较低的部分，并补充定向测试；
+  未直接合并 PR 分支，也未采纳其中改变启动方式、请求边界或凭据文件替换方式的改动。
+- 关联版本: v1.13.15 起（源码版本）
+
+## MoRanYue
+
+- GitHub: https://github.com/MoRanYue
+- 提议: https://github.com/CangShui/workbuddy-gateway/issues/21
+- 标题: `国际站 429 回退国内站后偶发 400/11128「Illegal API invocation from an unapproved channel」`
+- 采纳内容: 通过真实出站请求抓包与二分定位，确认上游会对 system 消息开头的
+  `You are an AI agent powered by DeepSeek Harness` 做渠道校验并返回 11128；
+  同时验证了前导空白、正文中段和 user 消息不会触发。
+- 落地方式: 新增 `sanitizeprefix.go`，在三个协议入口统一将 system 开头的该身份句
+  等义改写为中性前缀，正文其余部分逐字保留；补充边界、数组 content、
+  `developer` 归一化和三协议入口测试。
+- 关联版本: v1.14.21 起
+- 贡献者图: 通过 GitHub noreply 署名提交记录
 
 ## 说明
 

@@ -1,0 +1,34 @@
+{
+  "gateway": {
+    "apiPort": 8317,
+    "webPort": 8316,
+    "adminKey": "",
+    "apiKeyEnabled": false,
+    "apiKey": ""
+  },
+  "systemPrompt": {
+    "fallback": "",
+    "force": ""
+  },
+  "debug": {
+    "enabled": false,
+    "fullRequests": false
+  },
+  "logs": {
+    "retentionDays": 0
+  },
+  "upstream": {
+    "headerTimeoutSeconds": 300,
+    "idleTimeoutSeconds": 120,
+    "transientRetries": 2
+  },
+  "models": {
+    "blocklist": [],
+    "accounts": {
+      "all": {
+        "allowlist": [],
+        "blocklist": []
+      }
+    }
+  }
+}
