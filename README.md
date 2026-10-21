@@ -321,7 +321,7 @@
 - [build.ps1](build.ps1) 支持 Windows / Linux / macOS 的 x86、x64、ARM、ARM64 产物与 SHA256 清单。
 - 完整配置、网页操作、超时、诊断、企业账号与部署说明见 [`docs/user-guide.md`](docs/user-guide.md)。
 
-> 本仓库的 CI（`.github/workflows/release.yml`）与 `build.ps1` 都覆盖上述 9 个平台/架构组合；推送 `v*` tag 后会在 Releases 中发布全部产物与 `SHA256SUMS`。
+> 本仓库 CI（`.github/workflows/release.yml`）**只发布 Linux `amd64` / `arm64`** 两个产物及同名 `.sha256`；`build.ps1` 仍支持在本地构建完整矩阵，但不会随 Release 发布其他平台。
 
 ## 命令总览
 
@@ -878,9 +878,9 @@ llm-pi-ai:
 
 ## 各平台部署
 
-> **产物来源说明**：本仓库的 [build.ps1](build.ps1) 与 GitHub Actions（`.github/workflows/release.yml`）都支持 Windows / Linux / macOS 的 x86、x64、ARM、ARM64 完整矩阵，并生成 SHA256 清单/SHA256SUMS。
-> 推送 `v*` tag 后，可直接从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases)下载对应平台产物；
-> 也可以本地运行 `build.ps1`。
+> **产物来源说明**：GitHub Actions（`.github/workflows/release.yml`）**只发布 Linux `amd64` / `arm64`**；推送 `v*` tag 后可从这里下载。
+> [build.ps1](build.ps1) 支持 Windows / Linux / macOS 的 x86、x64、ARM、ARM64 完整矩阵，但**仅用于本地构建**，其他平台不随本仓库 Release 发布。
+> Windows / macOS 也可以从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases)下载。
 
 ### 本地构建全部产物
 
@@ -895,11 +895,11 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Only linux -Architecture a
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Clean -SkipTests
 ```
 
-脚本会先用当前 Go 工具链交叉编译（`CGO_ENABLED=0`），再生成 `SHA256SUMS` 与 `build-manifest.json`。产物命名与 Release 一致。
+脚本会先用当前 Go 工具链交叉编译（`CGO_ENABLED=0`），再生成 `SHA256SUMS` 与 `build-manifest.json`。Linux `amd64` / `arm64` 的命名与 Release 一致，其他平台仅本地使用。
 
 ### Windows
 
-1. 从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases) 下载 `workbuddy-gateway-windows-amd64.exe`（或 386 / arm64），或用本仓库 `build.ps1` 本地构建，或直接交叉编译：
+1. 从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`，或用本仓库 `build.ps1` 本地构建，或直接交叉编译：
 
    ```powershell
    $env:GOOS='windows'; $env:GOARCH='amd64'; $env:CGO_ENABLED='0'
@@ -993,7 +993,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ### macOS
 
-1. 从[本仓库 Releases](https://github.com/gakiyukr/workbuddy_to_api_plus/releases) 下载 `workbuddy-gateway-darwin-arm64`（Apple Silicon）或 `workbuddy-gateway-darwin-amd64`（Intel）；也可用 `build.ps1` 或本地交叉编译：
+1. 从[基线仓库 Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-darwin-arm64`（Apple Silicon）或 `workbuddy-gateway-darwin-amd64`（Intel）；也可用本仓库 `build.ps1` 或本地交叉编译：
 
    ```bash
    GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-darwin-arm64 .
@@ -1085,9 +1085,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 推送 `v*` 形式的 tag 时，GitHub Actions（`.github/workflows/release.yml`）会自动：
 
 1. 运行 `go vet` + `go test`（不通过则中止，不发布坏产物）；
-2. 交叉编译 9 个平台/架构组合（Windows/Linux/macOS 的 x86、x64、ARMv7、ARM64，`CGO_ENABLED=0`）；
-3. 为每个产物生成 `.sha256`，并生成汇总 `SHA256SUMS`；
-4. 创建 GitHub Release 并上传全部产物，下载即可用。
+2. 交叉编译 Linux `amd64` / `arm64` 静态二进制（`CGO_ENABLED=0`）；
+3. 为每个产物生成同名 `.sha256`；
+4. 创建 GitHub Release 并上传两个 Linux 产物及校验文件，下载即可用。
 
 发布前会校验 tag 与 `main.go` 中的 `version` 常量一致，避免名实不符。当前 `main.go` 的版本是 `1.15.0`。
 

@@ -1,11 +1,10 @@
-# 推送版本 tag（v*）时自动构建全平台产物并发布 GitHub Release。
+# 推送版本 tag（v*）时自动构建 Linux amd64 / arm64 产物并发布 GitHub Release。
 #
-# 矩阵与 build.ps1 保持一致：
-#   windows-386 / windows-amd64 / windows-arm64
-#   linux-386 / linux-amd64 / linux-armv7 / linux-arm64
-#   darwin-amd64 / darwin-arm64
+# 产物命名与 README「从源码构建」保持一致：
+#   workbuddy-gateway-linux-amd64 / workbuddy-gateway-linux-arm64
+# 其他平台/架构不随 Release 发布；需要时可在本地运行 build.ps1。
+#
 # 构建前先跑 go vet + go test：测试不过就不发布，避免发出坏产物。
-#
 # 权限最小化：默认 workflow 权限为 read，发布 Release 需要显式授予 contents: write。
 name: Release
 
@@ -39,15 +38,8 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { goos: windows, goarch: '386', suffix: windows-386, ext: '.exe' }
-          - { goos: windows, goarch: amd64, suffix: windows-amd64, ext: '.exe' }
-          - { goos: windows, goarch: arm64, suffix: windows-arm64, ext: '.exe' }
-          - { goos: linux, goarch: '386', suffix: linux-386, ext: '' }
-          - { goos: linux, goarch: amd64, suffix: linux-amd64, ext: '' }
-          - { goos: linux, goarch: arm, goarm: '7', suffix: linux-armv7, ext: '' }
-          - { goos: linux, goarch: arm64, suffix: linux-arm64, ext: '' }
-          - { goos: darwin, goarch: amd64, suffix: darwin-amd64, ext: '' }
-          - { goos: darwin, goarch: arm64, suffix: darwin-arm64, ext: '' }
+          - { goos: linux, goarch: amd64, suffix: linux-amd64 }
+          - { goos: linux, goarch: arm64, suffix: linux-arm64 }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -55,14 +47,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+      - name: Build linux/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: '0'
         run: |
-          out="workbuddy-gateway-${{ matrix.suffix }}${{ matrix.ext }}"
+          out="workbuddy-gateway-${{ matrix.suffix }}"
           go build -trimpath -ldflags="-s -w" -o "$out" .
           sha256sum "$out" > "$out.sha256"
 
@@ -70,8 +61,8 @@ jobs:
         with:
           name: workbuddy-gateway-${{ matrix.suffix }}
           path: |
-            workbuddy-gateway-${{ matrix.suffix }}${{ matrix.ext }}
-            workbuddy-gateway-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+            workbuddy-gateway-${{ matrix.suffix }}
+            workbuddy-gateway-${{ matrix.suffix }}.sha256
           if-no-files-found: error
 
   release:
@@ -86,12 +77,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-
-      - name: Generate consolidated checksums
-        run: |
-          cd dist
-          files=$(ls workbuddy-gateway-* | grep -v '\.sha256$')
-          sha256sum $files > SHA256SUMS
 
       - name: List release assets
         run: ls -la dist/
@@ -120,17 +105,12 @@ jobs:
             echo
             echo "| 文件 | 平台 |"
             echo "|---|---|"
-            echo "| \`workbuddy-gateway-windows-386.exe\` | Windows x86 |"
-            echo "| \`workbuddy-gateway-windows-amd64.exe\` | Windows x86_64 |"
-            echo "| \`workbuddy-gateway-windows-arm64.exe\` | Windows ARM64 |"
-            echo "| \`workbuddy-gateway-linux-386\` | Linux x86 |"
             echo "| \`workbuddy-gateway-linux-amd64\` | Linux x86_64 |"
-            echo "| \`workbuddy-gateway-linux-armv7\` | Linux ARMv7 |"
             echo "| \`workbuddy-gateway-linux-arm64\` | Linux ARM64 |"
-            echo "| \`workbuddy-gateway-darwin-amd64\` | macOS x86_64 |"
-            echo "| \`workbuddy-gateway-darwin-arm64\` | macOS ARM64 |"
             echo
-            echo "均为静态链接单二进制（CGO 关闭），下载后 \`chmod +x\` 即可运行；校验见同名 \`.sha256\` 或 \`SHA256SUMS\`。"
+            echo "均为静态链接单二进制（CGO 关闭），下载后 \`chmod +x\` 即可运行；校验见同名 \`.sha256\` 文件。"
+            echo
+            echo "其他平台/架构不随本 Release 发布，可在本地运行 \`build.ps1\` 构建。"
             echo
             echo "### 变更"
             echo
@@ -151,4 +131,7 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "WorkBuddy Local Gateway ${GITHUB_REF_NAME}" \
             --notes-file notes.md \
-            dist/*
+            dist/workbuddy-gateway-linux-amd64 \
+            dist/workbuddy-gateway-linux-amd64.sha256 \
+            dist/workbuddy-gateway-linux-arm64 \
+            dist/workbuddy-gateway-linux-arm64.sha256
