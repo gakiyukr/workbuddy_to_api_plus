@@ -17,6 +17,9 @@ func newAPIHandler() http.Handler {
 	mux.HandleFunc("/responses", handleResponses)
 	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/models", handleModels)
+	// DSH Search / Fetch API compatibility.
+	mux.HandleFunc("/v1/search", handleWebSearch)
+	mux.HandleFunc("/v1/fetch", handleWebFetch)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/ping", handleHealth)
 	mux.HandleFunc("/admin/probe", handleAdminProbe)

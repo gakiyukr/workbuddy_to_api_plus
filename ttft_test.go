@@ -63,7 +63,7 @@ func TestTTFTAllResponsePaths(t *testing.T) {
 		fn   func(http.ResponseWriter, *http.Request, *http.Response, *Account, time.Time)
 	}{
 		{"chat_stream", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
-			streamChatResponse(w, r, resp, "metric-model", 1, a, &profileCN, s)
+			streamChatResponseWithReplay(w, r, resp, "metric-model", 1, a, &profileCN, s, nil, "")
 		}},
 		{"chat_aggregate", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
 			writeChatAggregate(w, r, resp, "metric-model", 1, a, &profileCN, s)
@@ -288,8 +288,8 @@ func TestTTFTCompletedStreamKeepsSampleAfterClientDisconnect(t *testing.T) {
 		fmt.Fprint(pipeW, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":7,\"credit\":0.1}}\n\ndata: [DONE]\n\n")
 	}()
 	rec := &doneDisconnectWriter{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}
-	streamChatResponse(rec, r, &http.Response{Body: pipeR}, "metric-model", 1,
-		&Account{Path: "synthetic.json"}, &profileCN, start)
+	streamChatResponseWithReplay(rec, r, &http.Response{Body: pipeR}, "metric-model", 1,
+		&Account{Path: "synthetic.json"}, &profileCN, start, nil, "")
 	<-done
 
 	if r.Context().Err() == nil {

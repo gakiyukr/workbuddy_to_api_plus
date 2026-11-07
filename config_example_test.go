@@ -59,6 +59,12 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	}
 	exampleSchema := runtimeFileConfig{}
 	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
+	// identity.replacements 是 map：schema 侧填入默认规则，
+	// 示例文件中的具体键路径才能与运行时结构对齐比较。
+	identityEnabled := true
+	identityResponseRestore := false
+	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy",
+		Replacements: defaultIdentityReplacements("WorkBuddy"), ResponseRestore: &identityResponseRestore}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)

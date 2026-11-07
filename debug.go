@@ -72,7 +72,15 @@ type runtimeFileConfig struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
-	Debug debugFileConfig `json:"debug"`
+	// Identity 控制 system/developer/assistant 中所有配置文字替换。
+	// 省略时使用内置 WorkBuddy 展示名及默认文本规则。
+	Identity runtimeIdentityConfig `json:"identity"`
+	// 仅接受 v1.14.40 曾写入的旧字段，避免升级时因未知字段无法启动。
+	// 不解析或执行其中规则；新的文本替换统一由 Identity 控制。
+	DeprecatedPromptCompatibility json.RawMessage `json:"promptCompatibility,omitempty"`
+	// 仅接受上游 v1.14.30+ 写入的并发配置；本 fork 未启用并发控制，保留原值不执行。
+	Concurrent json.RawMessage `json:"concurrent,omitempty"`
+	Debug      debugFileConfig `json:"debug"`
 	Logs  struct {
 		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
 	} `json:"logs"`
@@ -85,6 +93,11 @@ type runtimeFileConfig struct {
 		// TransientRetries：请求体发送阶段遇到瞬时网络错误的额外重试次数。
 		// 用指针区分「未配置」（用默认值）与「显式设为 0」（禁用重试）。
 		TransientRetries *int `json:"transientRetries"`
+		// StreamKeepaliveSeconds：等待上游首字节期间的 SSE 注释间隔；<=0 或省略用默认值。
+		StreamKeepaliveSeconds int `json:"streamKeepaliveSeconds"`
+		// EnableFirstByteRetry：是否允许首字节前对瞬时网络中断安全重放一次。
+		// 指针区分「未配置」（默认开启）与显式 false（关闭）。
+		EnableFirstByteRetry *bool `json:"enableFirstByteRetry"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {

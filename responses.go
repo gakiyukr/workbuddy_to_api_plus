@@ -64,6 +64,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := respReq["stream"].(bool)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	// 身份还原只读取转换前的原始请求；出站请求体不受影响。
+	planIdentityRestore(r, respReq)
 	prepareConversationContext(r, respReq)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
@@ -90,12 +92,17 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	translateMaxCompletionTokens(chatReq)
 
 	applyThinkingRules(chatReq, modelName)
+	// identity 文字替换（请求侧）：首位通配只跑一次客户端原始块。
+	normalizeDeveloperRoles(chatReq, r, reqID)
+	applyOriginalIdentityReplacements(chatReq, r, reqID)
 	if modified := sanitizeMessages(chatReq); modified > 0 {
 		logSystemPrefixSanitized(r, reqID, modified)
 	}
 	// 顺序与 chat 入口一致：先做首条 system 归一化（prepareSystemPromptForUpstream
 	// 内部调用 ensureLeadingSystemMessage），再做配对归一化（最后一道改写）。
 	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
+	// identity 第二遍字面替换：覆盖 systemprompt 注入后的文本；禁用首位通配。
+	applyIdentityRulePass(chatReq, r, reqID, false)
 	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
 	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
 	ensureUpstreamMaxTokens(chatReq, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
@@ -603,6 +610,7 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 		writeOpenAIError(w, http.StatusInternalServerError, "translate_error", "转换 Responses 响应失败: "+err.Error())
 		return
 	}
+	out = restoreResponsesIdentity(r, out)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
@@ -849,6 +857,15 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	finishReason := ""
 	sawDone := false
 
+	// 身份还原：推理摘要与正文事件各自持有跨分片尾部缓存；
+	// 每个条目的收尾事件（done / output_item.done / response.completed）使用补全后的全文。
+	restorePlan := identityRestoreFor(r)
+	var reasoningRestorer, msgRestorer *identityRestorer
+	if restorePlan.active() {
+		reasoningRestorer = newIdentityRestorer(restorePlan)
+		msgRestorer = newIdentityRestorer(restorePlan)
+	}
+
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
 	scanner := bufio.NewScanner(body)
@@ -883,17 +900,33 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 			}
 			if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
 				openReasoning()
-				reasoningSB.WriteString(rc)
-				emit("response.reasoning_summary_text.delta", map[string]any{
-					"item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "delta": rc,
-				})
+				eventDelta := rc
+				if reasoningRestorer != nil {
+					eventDelta = reasoningRestorer.Write(rc)
+					reasoningSB.WriteString(eventDelta)
+				} else {
+					reasoningSB.WriteString(rc)
+				}
+				if eventDelta != "" {
+					emit("response.reasoning_summary_text.delta", map[string]any{
+						"item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "delta": eventDelta,
+					})
+				}
 			}
 			if ct, ok := delta["content"].(string); ok && ct != "" {
 				openMessage()
-				msgSB.WriteString(ct)
-				emit("response.output_text.delta", map[string]any{
-					"item_id": msgItemID, "output_index": msgIndex, "content_index": 0, "delta": ct,
-				})
+				eventDelta := ct
+				if msgRestorer != nil {
+					eventDelta = msgRestorer.Write(ct)
+					msgSB.WriteString(eventDelta)
+				} else {
+					msgSB.WriteString(ct)
+				}
+				if eventDelta != "" {
+					emit("response.output_text.delta", map[string]any{
+						"item_id": msgItemID, "output_index": msgIndex, "content_index": 0, "delta": eventDelta,
+					})
+				}
 			}
 			if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
 				// 先提取本次参数增量，供合并后补发 delta 事件
@@ -999,6 +1032,14 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 
 	// 收尾：reasoning
 	if reasoningOpen {
+		if reasoningRestorer != nil {
+			if tail := reasoningRestorer.Flush(); tail != "" {
+				reasoningSB.WriteString(tail)
+				emit("response.reasoning_summary_text.delta", map[string]any{
+					"item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "delta": tail,
+				})
+			}
+		}
 		text := reasoningSB.String()
 		emit("response.reasoning_summary_text.done", map[string]any{"item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "text": text})
 		emit("response.reasoning_summary_part.done", map[string]any{"item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": text}})
@@ -1009,6 +1050,14 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 
 	// 收尾：message
 	if msgOpen {
+		if msgRestorer != nil {
+			if tail := msgRestorer.Flush(); tail != "" {
+				msgSB.WriteString(tail)
+				emit("response.output_text.delta", map[string]any{
+					"item_id": msgItemID, "output_index": msgIndex, "content_index": 0, "delta": tail,
+				})
+			}
+		}
 		text := msgSB.String()
 		emit("response.output_text.done", map[string]any{"item_id": msgItemID, "output_index": msgIndex, "content_index": 0, "text": text})
 		emit("response.content_part.done", map[string]any{"item_id": msgItemID, "output_index": msgIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "annotations": []any{}, "text": text}})
@@ -1057,4 +1106,57 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 // compactUUID 返回去掉连字符的随机 UUID。
 func compactUUID() string {
 	return strings.ReplaceAll(uuid.NewString(), "-", "")
+}
+
+// restoreResponsesIdentity 对 Responses 聚合响应做身份还原。
+// 只改写 output 中 message 的 output_text 与 reasoning 的 summary_text；
+// 工具调用参数、引用标记与响应骨架保持原样。未开启还原时原样返回输入字节。
+func restoreResponsesIdentity(r *http.Request, encoded []byte) []byte {
+	plan := identityRestoreFor(r)
+	if !plan.active() {
+		return encoded
+	}
+	var response map[string]any
+	if json.Unmarshal(encoded, &response) != nil {
+		return encoded
+	}
+	output, _ := response["output"].([]any)
+	changed := false
+	for _, itemAny := range output {
+		item, ok := itemAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		var parts []any
+		switch item["type"] {
+		case "message":
+			parts, _ = item["content"].([]any)
+		case "reasoning":
+			parts, _ = item["summary"].([]any)
+		default:
+			continue
+		}
+		for _, partAny := range parts {
+			part, ok := partAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			text, ok := part["text"].(string)
+			if !ok || text == "" {
+				continue
+			}
+			if next := restoreIdentityText(plan.rules, text); next != text {
+				part["text"] = next
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return encoded
+	}
+	out, err := json.Marshal(response)
+	if err != nil {
+		return encoded
+	}
+	return out
 }

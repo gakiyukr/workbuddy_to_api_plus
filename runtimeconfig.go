@@ -4,15 +4,21 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+//go:embed config.example.json
+var embeddedDefaultRuntimeConfig []byte
 
 // 所有进程内配置文件读改写共用此锁，避免网页写入与热加载互相覆盖。
 // 锁序：runtimeConfigMu -> gatewayConfigMu；调度不持有此锁。
@@ -23,6 +29,10 @@ var statusSnapshotWriteMu sync.Mutex
 // 与运行时状态同步更新，不能仅由扫描协程缓存：网页写入后立即撤回旧文件也必须生效。
 var runtimeAppliedHash [32]byte
 var runtimeHasAppliedHash bool
+
+// deprecatedPromptCompatibilityPresent 标记配置里是否残留已废弃的
+// promptCompatibility 字段（仅接受、不执行），用于启动与热加载时的迁移告警。
+var deprecatedPromptCompatibilityPresent atomic.Bool
 
 func parseRuntimeConfig(data []byte) (runtimeFileConfig, error) {
 	var c runtimeFileConfig
@@ -75,6 +85,213 @@ func hasModelNames(names []string) bool {
 	return false
 }
 
+// ensureRuntimeConfigFile creates a complete default config for a new user and
+// adds missing default sections to older configs. Existing values are preserved;
+// initialization errors are warnings at startup, not a reason to stop serving.
+func ensureRuntimeConfigFile(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return writeNewRuntimeConfig(path)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("config.json 不是普通文件")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil || doc == nil {
+		return nil // 交给正常配置校验报错；不覆盖半写或非法配置。
+	}
+	changed := false
+	hasKey := func(object map[string]json.RawMessage, name string) bool {
+		for k := range object {
+			if strings.EqualFold(k, name) {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasKey(doc, "identity") {
+		doc["identity"], err = json.Marshal(defaultIdentityConfig())
+		if err != nil {
+			return err
+		}
+		changed = true
+	} else {
+		updated, updateErr := ensureIdentityDefaultReplacements(doc)
+		if updateErr != nil {
+			return updateErr
+		}
+		changed = changed || updated
+	}
+	if !changed {
+		return nil
+	}
+	updated, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	updated = append(updated, '\n')
+	if bytes.Equal(updated, raw) {
+		return nil
+	}
+	temporary := path + ".identity-" + fmt.Sprint(os.Getpid()) + ".tmp"
+	fd, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temporary)
+	if _, err := fd.Write(updated); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		return err
+	}
+	log.Printf("[配置初始化] 已补充缺失的 identity 默认配置；实验功能 identity.responseRestore 缺省补为 false，已有值和其他配置保留，后续修改仍可热加载")
+	return nil
+}
+
+// ensureIdentityDefaultReplacements upgrades older identities without
+// overwriting user-defined values. Missing replacement maps receive the full
+// default set because a non-empty custom map disables runtime defaults.
+func ensureIdentityDefaultReplacements(doc map[string]json.RawMessage) (bool, error) {
+	identityKey := ""
+	for key := range doc {
+		if strings.EqualFold(key, "identity") {
+			identityKey = key
+			break
+		}
+	}
+	if identityKey == "" {
+		return false, nil
+	}
+	var identity map[string]json.RawMessage
+	if json.Unmarshal(doc[identityKey], &identity) != nil {
+		return false, nil
+	}
+	if identity == nil {
+		// A legacy null section already used runtime defaults; persist the same
+		// effective defaults so the upgraded configuration is editable as well.
+		encoded, err := json.Marshal(defaultIdentityConfig())
+		if err != nil {
+			return false, err
+		}
+		doc[identityKey] = encoded
+		return true, nil
+	}
+	changed := false
+	hasRestore := false
+	for key := range identity {
+		if strings.EqualFold(key, "responseRestore") {
+			hasRestore = true
+			break
+		}
+	}
+	if !hasRestore {
+		identity["responseRestore"] = json.RawMessage("false")
+		changed = true
+	}
+	target := "WorkBuddy"
+	for key, raw := range identity {
+		if strings.EqualFold(key, "target") {
+			var configured string
+			if json.Unmarshal(raw, &configured) == nil && strings.TrimSpace(configured) != "" {
+				target = strings.TrimSpace(configured)
+			}
+			break
+		}
+	}
+	replacementsKey := ""
+	for key := range identity {
+		if strings.EqualFold(key, "replacements") {
+			replacementsKey = key
+			break
+		}
+	}
+	if replacementsKey == "" {
+		encoded, err := json.Marshal(defaultIdentityReplacements(target))
+		if err != nil {
+			return false, err
+		}
+		identity["replacements"] = encoded
+	} else {
+		var replacements map[string]string
+		if json.Unmarshal(identity[replacementsKey], &replacements) != nil {
+			return false, nil // 非法类型交给完整配置校验，不擅自覆盖。
+		}
+		// A non-empty custom map disables runtime defaults, so merge every missing
+		// built-in rule while never overwriting an explicitly customized value.
+		defaults := defaultIdentityReplacements(target)
+		// Preserve the former configured DSH destination during migration,
+		// but persist it as an ordinary editable rule rather than a runtime special case.
+		if dshTarget := strings.TrimSpace(replacements["DeepSeek Harness"]); dshTarget != "" {
+			defaults[defaultDSHIdentityText] = "You are " + replacements["DeepSeek Harness"]
+		}
+		if replacements == nil {
+			replacements = make(map[string]string, len(defaults))
+		}
+		updated := false
+		for old, newValue := range defaults {
+			if _, exists := replacements[old]; !exists {
+				replacements[old] = newValue
+				updated = true
+			}
+		}
+		if !updated && !changed {
+			return false, nil
+		}
+		encoded, err := json.Marshal(replacements)
+		if err != nil {
+			return false, err
+		}
+		identity[replacementsKey] = encoded
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return false, err
+	}
+	doc[identityKey] = encoded
+	return true, nil
+}
+
+func writeNewRuntimeConfig(path string) error {
+	data := append([]byte(nil), embeddedDefaultRuntimeConfig...)
+	fd, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := fd.Write(data); err != nil {
+		fd.Close()
+		os.Remove(path)
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	log.Printf("[配置初始化] 已生成默认 config.json")
+	return nil
+}
+
 func loadRuntimeConfig(path string) error {
 	runtimeConfigMu.Lock()
 	defer runtimeConfigMu.Unlock()
@@ -120,6 +337,9 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
+	setIdentityConfig(c.Identity)
+	deprecatedPromptCompatibilityPresent.Store(len(c.DeprecatedPromptCompatibility) > 0)
+	logIdentityRuntimeConfig(trace)
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))
 	header, idle, retries := upstreamHeaderTimeoutDefault, upstreamIdleTimeoutDefault, upstreamTransientRetriesDefault
 	if n := c.Upstream.HeaderTimeoutSeconds; n > 0 {
@@ -131,12 +351,22 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	if n := c.Upstream.TransientRetries; n != nil && *n >= 0 {
 		retries = *n
 	}
+	keepalive := streamKeepaliveDefault
+	if n := c.Upstream.StreamKeepaliveSeconds; n > 0 {
+		keepalive = time.Duration(n) * time.Second
+	}
+	firstByteRetry := enableFirstByteRetryDefault
+	if n := c.Upstream.EnableFirstByteRetry; n != nil {
+		firstByteRetry = *n
+	}
 	upstreamConfigMu.Lock()
 	upstreamHeaderTimeout, upstreamIdleTimeout, upstreamTransientRetries = header, idle, retries
+	streamKeepalive = keepalive
+	enableFirstByteRetry = firstByteRetry
 	upstreamConfigMu.Unlock()
 	if hot {
-		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
-			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries)
+		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 流心跳=%v 首字节重放=%t 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
+			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries, keepalive, firstByteRetry)
 	}
 	return nil
 }
@@ -147,9 +377,41 @@ func upstreamSettings() (time.Duration, time.Duration, int) {
 	return upstreamHeaderTimeout, upstreamIdleTimeout, upstreamTransientRetries
 }
 
+func logIdentityRuntimeConfig(trace string) {
+	enabled, target, rules := identitySettingsSummary()
+	literal, wildcard, invalid := identityRuleDetails()
+	settings := identitySnapshot()
+	log.Printf("[响应身份还原配置] traceId=%s 实验功能=true 配置开关=%t 实际启用=%t 说明=默认false；升级仅补充缺失开关；仅明确且唯一的身份声明可还原，URL和文件路径保留，已有请求保持原计划",
+		trace, settings.responseRestore, settings.enabled && settings.responseRestore)
+	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 字面规则=%d 首位通配规则=%d 忽略非法规则=%d 说明=所有文字替换均按identity.replacements执行；仅处理system/developer/assistant文本；热加载只影响后续请求",
+		trace, enabled, target, rules, literal, wildcard, invalid)
+	if invalid > 0 {
+		log.Printf("[替换规则告警] traceId=%s 忽略条数=%d 原因=空键或非法通配边界 说明=通配仅支持一个(.*)，必须有非空首尾文本且不得跨行；其他有效规则仍生效，未记录规则正文",
+			trace, invalid)
+	}
+	if deprecatedPromptCompatibilityPresent.Load() {
+		log.Printf("[废弃配置] traceId=%s 字段=promptCompatibility 结果=已忽略 说明=重复替换模块已移除；请将需要保留的规则配置在 identity.replacements 中，确认后可删除旧字段；未记录旧规则正文",
+			trace)
+	}
+}
+
 func currentIdleTimeout() time.Duration {
 	_, idle, _ := upstreamSettings()
 	return idle
+}
+
+// currentStreamKeepalive 返回当前流式心跳间隔（0 表示关闭）。
+func currentStreamKeepalive() time.Duration {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return streamKeepalive
+}
+
+// currentFirstByteRetry 返回当前首字节前重放开关。
+func currentFirstByteRetry() bool {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return enableFirstByteRetry
 }
 
 func switchDebugLogging(enabled bool) error {

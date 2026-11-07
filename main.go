@@ -81,6 +81,12 @@ const (
 
 	// upstreamRetryBackoff 是两次重试之间的等待，给上游边缘节点留出恢复时间。
 	upstreamRetryBackoffDefault = 300 * time.Millisecond
+
+	// streamKeepaliveDefault 是等待上游首个有效数据期间向下游发送 SSE 注释的间隔。
+	// 腾讯边缘节点对「响应头已发出但长时间无首个字节」的连接较敏感，默认 15s。
+	streamKeepaliveDefault = 15 * time.Second
+	// enableFirstByteRetryDefault 允许在客户端尚未收到任何有效数据时安全重放一次。
+	enableFirstByteRetryDefault = true
 )
 
 var errModelAccountPolicy = errors.New("model account policy rejected all accounts")
@@ -99,6 +105,10 @@ var (
 	upstreamTransientRetries = upstreamTransientRetriesDefault
 	// upstreamRetryBackoff 为生效的重试间隔（测试可调小）。
 	upstreamRetryBackoff = upstreamRetryBackoffDefault
+	// streamKeepalive 为生效的流式心跳间隔（0 表示关闭）。
+	streamKeepalive = streamKeepaliveDefault
+	// enableFirstByteRetry 为生效的首字节前重放开关。
+	enableFirstByteRetry = enableFirstByteRetryDefault
 )
 
 // isTransientNetworkError 判断错误是否为「瞬时网络故障」，这类错误值得重试。
@@ -134,6 +144,10 @@ func isTransientNetworkError(err error) bool {
 		"unexpected eof",
 		"http2: server sent goaway",
 		"stream error",
+		// Windows Winsock：WSAECONNRESET / WSAECONNABORTED 的文案与 POSIX 不同，
+		// 不含 "connection reset by peer"。msg 已转小写，此处必须小写。
+		"forcibly closed",
+		"an established connection was aborted",
 	} {
 		if strings.Contains(msg, marker) {
 			return true
@@ -649,6 +663,9 @@ func main() {
 	})
 	serveCommand := command == "serve" || command == "run" || command == "start"
 	if serveCommand || command == "probe" {
+		if err := ensureRuntimeConfigFile(runtimeConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "配置初始化警告: %v（继续使用内存默认值）\n", err)
+		}
 		if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 			os.Exit(1)
@@ -4656,6 +4673,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := reqObj["stream"].(bool)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	// 身份还原只读入站原始请求；出站请求体与入站替换保持原样。
+	planIdentityRestore(r, reqObj)
 	prepareConversationContext(r, reqObj)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
@@ -4715,7 +4734,12 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 模板净化：改写 Claude Code 等框架被腾讯官方逐字拉黑的固定 prompt 语句
+	// identity 文字替换（请求侧）：首位通配只跑一次客户端原始块，
+	// 涵盖默认的身份展示名与渠道兼容规则（含旧模板净化的 DSH 前缀句）。
+	normalizeDeveloperRoles(reqObj, r, reqID)
+	applyOriginalIdentityReplacements(reqObj, r, reqID)
+
+	// 指纹净化：剥离 assistant/reasoning 内容中的计费头等上游指纹
 	if modified := sanitizeMessages(reqObj); modified > 0 {
 		logSystemPrefixSanitized(r, reqID, modified)
 	}
@@ -4725,6 +4749,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// prepareSystemPromptForUpstream 内部先调用 ensureLeadingSystemMessage，再套用
 	// config.json 的 fallback/force；此顺序必须早于配对归一化。
 	prepareSystemPromptForUpstream(reqObj, r, reqID, w.Header().Get("X-Trace-ID"))
+	// identity 第二遍字面替换：覆盖 systemprompt 注入与模板净化之后的文本，
+	// 首位通配只在第一遍生效，此处禁用，防止通配吃掉正文。
+	applyIdentityRulePass(reqObj, r, reqID, false)
 	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
 	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
 	ensureUpstreamMaxTokens(reqObj, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
@@ -4755,15 +4782,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isStream {
-		streamChatResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
+		streamChatResponseWithReplay(w, r, resp, modelName, reqID, acc, prof, startTime, upstreamBytes, resolveConversationID(reqObj))
 	} else {
 		writeChatAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
 	}
 }
 
-// streamChatResponse 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应。
-func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
-	defer resp.Body.Close()
+// streamChatResponseWithReplay 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应：
+// 空闲期发送 SSE 注释心跳，首个有效数据前允许对瞬时网络中断安全重放一次；
+// 心跳与数据写入共用 streamWriteGuard，避免 net/http ResponseWriter 并发写。
+func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time, upstreamBytes []byte, conversationID string) {
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -4775,112 +4808,189 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		return
 	}
 
-	body := newTTFTReader(resp.Body, startTime)
-	defer finishFirstToken(r, modelName, reqID, body)
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	var usage map[string]any
-	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，供逐 chunk 透传时
-	// 收敛 name 为「每 index 一次」（对齐 OpenAI 官方流，防累加型客户端把工具名拼成
-	// Bash×帧数）。
-	toolCallSeen := map[int]bool{}
-	finishReason := ""
-	sawDone := false
-	for scanner.Scan() {
-		cleanData := stripDataPrefix(scanner.Text())
-		if cleanData == "" {
+	guard := &streamWriteGuard{w: w, flusher: flusher}
+	heartbeat := startStreamHeartbeat(guard, currentStreamKeepalive())
+	defer heartbeat.Stop()
+
+	var finalBody *ttftReader
+	defer func() {
+		if finalBody != nil {
+			finishFirstToken(r, modelName, reqID, finalBody)
+		}
+	}()
+
+	replayBudget := 0
+	if upstreamBytes != nil && currentFirstByteRetry() {
+		replayBudget = 1
+	}
+	replays := 0
+
+	for attempt := 0; ; attempt++ {
+		body := newTTFTReader(resp.Body, startTime)
+		finalBody = body
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		var usage map[string]any
+		// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，供逐 chunk 透传时
+		// 收敛 name 为「每 index 一次」（对齐 OpenAI 官方流，防累加型客户端把工具名拼成
+		// Bash×帧数）。
+		toolCallSeen := map[int]bool{}
+		finishReason := ""
+		sawDone := false
+		commentLines, metadataLines := 0, 0
+		// 每个通道的还原缓存都属于本次尝试；重放时从干净状态重新累积。
+		restorePlan := identityRestoreFor(r)
+		var restorers map[chatRestoreKey]*identityRestorer
+		if restorePlan.active() {
+			restorers = map[chatRestoreKey]*identityRestorer{}
+		}
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			if strings.HasPrefix(line, ":") {
+				// SSE 注释是保活信号，不是 JSON。不能包装成 data: : heartbeat，
+				// 否则 CPA 的 JSON/SSE 解析器会拒绝首帧并取消整个请求。
+				commentLines++
+				guard.writeUpstreamComment(line)
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") && !strings.HasPrefix(line, "{") && line != "[DONE]" {
+				// event/id/retry 及未知 SSE 字段不属于 Chat Completions 的数据。
+				// 保留既有裸 JSON 和重复 data: 前缀的兼容性。
+				metadataLines++
+				continue
+			}
+			cleanData := stripDataPrefix(line)
+			if cleanData == "" {
+				continue
+			}
+			if cleanData == "[DONE]" {
+				// 先记住，等确认有真实 finish_reason 再转发。
+				// 没有结束原因时转发 [DONE]，等于告诉客户端这次是正常结束。
+				sawDone = true
+				break
+			}
+			var chunk map[string]any
+			if json.Unmarshal([]byte(cleanData), &chunk) == nil {
+				observeFirstToken(body, chunk)
+				if u, ok := chunk["usage"].(map[string]any); ok {
+					usage = u
+				}
+				// 上游 error 帧（带 error 键）原样透传，但附加网关视角的 gateway_hint
+				// 补充说明——message 原文一律不动，hint 并列添加（见 attachHintToErrorFrame）。
+				if _, hasErr := chunk["error"]; hasErr {
+					cleanData = attachHintToErrorFrame(cleanData, frameGatewayHint(cleanData))
+				} else {
+					stripToolCallNames(chunk, toolCallSeen)
+					if raw, err := json.Marshal(chunk); err == nil {
+						cleanData = string(raw)
+					}
+				}
+				finishReason = noteFinishReason(finishReason, chunk)
+			}
+			if restorePlan.active() {
+				if cleanedChunk := cleanChunkObject(cleanData, restorePlan, restorers); cleanedChunk != "" {
+					writeRestoredChatChunk(guard, cleanedChunk, chunk, restorers)
+				}
+			} else if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
+				guard.writeData(cleanedChunk)
+			}
+		}
+		scanErr := scanner.Err()
+		// 只有确认上游正常完成时才补发剩余尾部；中断或缺少 finish_reason
+		// 时保持残缺语义，不能把尾部伪造成完整回复。
+		if restorePlan.active() && scanErr == nil && finishReason != "" {
+			flushAllChatRestorers(guard, restorers)
+		}
+		if commentLines > 0 || metadataLines > 0 {
+			debugEvent(r, "debug", "stream_sse_framing_checked", map[string]any{
+				"comment_lines": commentLines, "metadata_lines": metadataLines,
+				"business_impact": "心跳按SSE注释转发，元数据不包装为JSON数据帧，避免CPA拒绝首包",
+			})
+			log.Printf("[流式协议] traceId=%s requestId=%d 阶段=Chat流转发 心跳注释数=%d 忽略元数据行数=%d 结果=已按SSE字段区分 业务影响=心跳不混入JSON数据帧；不记录正文",
+				debugTraceID(r), reqID, commentLines, metadataLines)
+		}
+
+		if canReplayStream(scanErr, guard.hasData(), replays < replayBudget, r.Context().Err() != nil) {
+			replays++
+			log.Printf("[首字节前重放] traceId=%s requestId=%d 模型=%s 账号=%s 原因=首个有效字节前上游连接中断（%v），客户端尚未收到内容，安全重放 第%d次",
+				debugTraceID(r), reqID, modelName, acc.Path, safeDebugError(scanErr), replays)
+			debugEvent(r, "warn", "stream_first_byte_replay", map[string]any{
+				"reason":          safeDebugError(scanErr),
+				"attempt":         attempt + 1,
+				"business_impact": "客户端未收到任何有效内容，重放可规避边缘节点静默期误杀；会额外消耗一次上游额度",
+			})
+			_ = resp.Body.Close()
+			resp = nil
+			newResp, newAcc, newProf, ok := replayUpstreamChat(w, r, reqID, modelName, upstreamBytes, startTime, guard, conversationID, true)
+			if !ok {
+				return
+			}
+			resp, acc, prof = newResp, newAcc, newProf
 			continue
 		}
-		if cleanData == "[DONE]" {
-			// 先记住，等确认有真实 finish_reason 再转发。
-			// 没有结束原因时转发 [DONE]，等于告诉客户端这次是正常结束。
-			sawDone = true
-			break
-		}
-		var chunk map[string]any
-		if json.Unmarshal([]byte(cleanData), &chunk) == nil {
-			observeFirstToken(body, chunk)
-			if u, ok := chunk["usage"].(map[string]any); ok {
-				usage = u
+
+		completeTokenStream(body, scanErr == nil && finishReason != "")
+		if scanErr != nil {
+			// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
+			// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
+			// 改为下发一条标准错误事件，让 CPA / 客户端明确知道这次响应不完整。
+			debugEvent(r, "error", "stream_response_failed", map[string]any{
+				"error_type": debugErrorType(scanErr),
+				"error":      safeDebugError(scanErr),
+			})
+			reason := "上游流式响应中断，本次回复不完整"
+			if errors.Is(scanErr, context.DeadlineExceeded) {
+				reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", currentIdleTimeout())
 			}
-			// 上游 error 帧（带 error 键）原样透传，但附加网关视角的 gateway_hint
-			// 补充说明——message 原文一律不动，hint 并列添加（见 attachHintToErrorFrame）。
-			if _, hasErr := chunk["error"]; hasErr {
-				cleanData = attachHintToErrorFrame(cleanData, frameGatewayHint(cleanData))
-			} else {
-				stripToolCallNames(chunk, toolCallSeen)
-				if raw, err := json.Marshal(chunk); err == nil {
-					cleanData = string(raw)
-				}
+			errPayload, _ := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"message": reason,
+					"type":    "upstream_stream_interrupted",
+					"code":    "stream_interrupted",
+				},
+			})
+			guard.writeData(string(errPayload))
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已向客户端下发中断错误而非伪造结束", debugTraceID(r), reqID, acc.Path, scanErr)
+		} else if finishReason == "" {
+			// 连接是正常关掉的（没有读错误），但整段流没有非空 finish_reason。
+			// 这不是成功：不能补 [DONE]，也不能记成 stream_response_completed。
+			debugEvent(r, "error", "stream_closed_without_finish", map[string]any{
+				"error_type":      "stream_closed_without_finish",
+				"finish_reason":   "",
+				"saw_done":        sawDone,
+				"business_impact": "上游干净结束但没有 finish_reason，已拒绝当成成功，未补发 [DONE]",
+			})
+			errPayload, _ := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"message": errStreamClosedWithoutFinish.Error(),
+					"type":    "upstream_stream_incomplete",
+					"code":    "stream_closed_without_finish",
+				},
+			})
+			guard.writeData(string(errPayload))
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流结束 账号=%s 结果=拒绝当成成功 原因=连接正常关闭但没有非空 finish_reason 是否看到DONE=%t 业务影响=不补发 [DONE]，客户端收到 stream_closed_without_finish 是否已处理=是",
+				debugTraceID(r), reqID, acc.Path, sawDone)
+		} else {
+			if sawDone {
+				guard.writeData("[DONE]")
 			}
-			finishReason = noteFinishReason(finishReason, chunk)
+			debugEvent(r, "info", "stream_response_completed", map[string]any{
+				"status_code":   http.StatusOK,
+				"finish_reason": finishReason,
+				"saw_done":      sawDone,
+			})
 		}
-		if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
-			flusher.Flush()
+		observeModelCredit(acc, modelName, usage, reqID)
+		statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
+		recordModelTokens(modelName, usage, reqID)
+		recordModelLatency(modelName, time.Since(startTime))
+		if scanErr == nil && finishReason != "" {
+			log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
 		}
-	}
-	scanErr := scanner.Err()
-	completeTokenStream(body, scanErr == nil && finishReason != "")
-	if scanErr != nil {
-		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
-		// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
-		// 改为下发一条标准错误事件，让 CPA / 客户端明确知道这次响应不完整。
-		debugEvent(r, "error", "stream_response_failed", map[string]any{
-			"error_type": debugErrorType(scanErr),
-			"error":      safeDebugError(scanErr),
-		})
-		reason := "上游流式响应中断，本次回复不完整"
-		if errors.Is(scanErr, context.DeadlineExceeded) {
-			reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", currentIdleTimeout())
-		}
-		errPayload, _ := json.Marshal(map[string]any{
-			"error": map[string]any{
-				"message": reason,
-				"type":    "upstream_stream_interrupted",
-				"code":    "stream_interrupted",
-			},
-		})
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", errPayload)
-		flusher.Flush()
-		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已向客户端下发中断错误而非伪造结束", debugTraceID(r), reqID, acc.Path, scanErr)
-	} else if finishReason == "" {
-		// 连接是正常关掉的（没有读错误），但整段流没有非空 finish_reason。
-		// 这不是成功：不能补 [DONE]，也不能记成 stream_response_completed。
-		debugEvent(r, "error", "stream_closed_without_finish", map[string]any{
-			"error_type":      "stream_closed_without_finish",
-			"finish_reason":   "",
-			"saw_done":        sawDone,
-			"business_impact": "上游干净结束但没有 finish_reason，已拒绝当成成功，未补发 [DONE]",
-		})
-		errPayload, _ := json.Marshal(map[string]any{
-			"error": map[string]any{
-				"message": errStreamClosedWithoutFinish.Error(),
-				"type":    "upstream_stream_incomplete",
-				"code":    "stream_closed_without_finish",
-			},
-		})
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", errPayload)
-		flusher.Flush()
-		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流结束 账号=%s 结果=拒绝当成成功 原因=连接正常关闭但没有非空 finish_reason 是否看到DONE=%t 业务影响=不补发 [DONE]，客户端收到 stream_closed_without_finish 是否已处理=是",
-			debugTraceID(r), reqID, acc.Path, sawDone)
-	} else {
-		if sawDone {
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-		}
-		debugEvent(r, "info", "stream_response_completed", map[string]any{
-			"status_code":   http.StatusOK,
-			"finish_reason": finishReason,
-			"saw_done":      sawDone,
-		})
-	}
-	observeModelCredit(acc, modelName, usage, reqID)
-	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
-	recordModelTokens(modelName, usage, reqID)
-	recordModelLatency(modelName, time.Since(startTime))
-	if scanErr == nil && finishReason != "" {
-		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
+		return
 	}
 }
 
@@ -4899,6 +5009,8 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
+	// 非流式回复同样做身份还原：只处理 message.content 与 reasoning_content。
+	completionJSON = restoreChatCompletionIdentity(r, completionJSON)
 	usage := usageFromCompletion(completionJSON)
 	statsObserveUsage(r, usage, true)
 	observeModelCredit(acc, modelName, usage, reqID)
@@ -5268,16 +5380,9 @@ func sanitizeMessages(obj map[string]any) int {
 		// OpenAI 新版 developer 角色（GPT-5 系客户端/Codex）不被腾讯上游接受，
 		// 会返回 11128 "Illegal API invocation from an unapproved channel"，
 		// 统一归一化为 system（语义等价）。
+		// 注意：chat 入口已先跑 normalizeDeveloperRoles，这里只兜底其他入口。
 		if roleOfMessage(msg) == "developer" {
 			msg["role"] = "system"
-		}
-		// system 开头若是上游黑名单身份句（如 DeepSeek Harness），等义改写前缀；
-		// 只处理偏移 0，正文逐字保留。
-		if roleOfMessage(msg) == "system" {
-			if content, changed := sanitizeSystemMessageContent(msg["content"]); changed {
-				msg["content"] = content
-				modified++
-			}
 		}
 		if c, ok := msg["content"]; ok {
 			if nc, changed := sanitizeContent(c); changed {
@@ -5299,6 +5404,27 @@ func sanitizeMessages(obj map[string]any) int {
 		}
 	}
 	return modified
+}
+
+// logSystemPrefixSanitized 只记录指纹净化的命中数量，不记录提示词正文。
+// 旧的 system 前缀改写已由 identity.replacements 默认规则接管。
+func logSystemPrefixSanitized(r *http.Request, requestID uint64, modified int) {
+	if modified <= 0 {
+		return
+	}
+	trace := debugTraceID(r)
+	if trace == "" {
+		trace = r.Header.Get("X-Trace-ID")
+	}
+	log.Printf("[指纹净化] traceId=%s requestId=%d 修改消息数=%d 结果=已剥离计费头指纹 说明=system 前缀身份句改由 identity 替换规则处理，不记录提示词正文",
+		trace, requestID, modified)
+	debugEvent(r, "info", "system_prompt_prefix_sanitized", map[string]any{
+		"rule":               "reasoning_billing_header_fingerprint",
+		"modified_messages":  modified,
+		"result":             "rewritten",
+		"business_impact":    "剥离 assistant/reasoning 内容中的上游指纹",
+		"prompt_body_logged": false,
+	})
 }
 
 // injectPromptCacheKey 注入上游 prompt_cache_key 字段（前缀缓存复用，费用优化）。
@@ -6694,7 +6820,179 @@ func frameGatewayHint(payload string) string {
 	return gatewayHint(classifyUpstream(http.StatusBadRequest, f.Error.Message))
 }
 
+// chatRestoreKey 在 n>1 的 Chat 流里隔离各 choice × 各文本通道的还原缓存，
+// 避免不同 choice 的正文互相串流。
+type chatRestoreKey struct {
+	choice  int
+	channel string
+}
+
+func chatRestoreKeyFor(choice int, channel string) chatRestoreKey {
+	return chatRestoreKey{choice: choice, channel: channel}
+}
+
+func strOf(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func intFloat(v any) int {
+	f, _ := v.(float64)
+	return int(f)
+}
+
+// writeRestoredChatChunk 保持以下顺序：本片正文/工具增量、被还原器扣留的尾部、
+// 纯 finish_reason 终止帧。终止片自身带正文时不能先 flush，否则正文会倒序。
+func writeRestoredChatChunk(guard *streamWriteGuard, cleaned string, original map[string]any, restorers map[chatRestoreKey]*identityRestorer) {
+	contentChunk, terminalChunk := splitFinishedChatChunk(cleaned)
+	if contentChunk != "" {
+		guard.writeData(contentChunk)
+	}
+	if terminalChunk == "" {
+		return
+	}
+	flushFinishedChatChoices(guard, restorers, original)
+	guard.writeData(terminalChunk)
+}
+
+// splitFinishedChatChunk 把带 finish_reason 的 Chat 分片拆成内容片和纯终止片。
+// usage 等顶层元数据留在内容片，终止片只保留 id/model 与 choices 的结束信息。
+func splitFinishedChatChunk(cleaned string) (string, string) {
+	var obj map[string]any
+	if json.Unmarshal([]byte(cleaned), &obj) != nil {
+		return cleaned, ""
+	}
+	choices, _ := obj["choices"].([]any)
+	terminal := make([]any, 0, len(choices))
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		finish := strOf(choice["finish_reason"])
+		if finish == "" {
+			continue
+		}
+		terminal = append(terminal, map[string]any{
+			"index":         intFloat(choice["index"]),
+			"delta":         map[string]any{},
+			"finish_reason": finish,
+		})
+		choice["finish_reason"] = nil
+	}
+	if len(terminal) == 0 {
+		return cleaned, ""
+	}
+	content, err := json.Marshal(obj)
+	if err != nil {
+		return cleaned, ""
+	}
+	terminalObj := map[string]any{"choices": terminal}
+	for _, key := range []string{"id", "object", "created", "model", "system_fingerprint"} {
+		if value, ok := obj[key]; ok {
+			terminalObj[key] = value
+		}
+	}
+	end, err := json.Marshal(terminalObj)
+	if err != nil {
+		return cleaned, ""
+	}
+	return string(content), string(end)
+}
+
+// flushFinishedChatChoices 在某个 choice 的 finish_reason 帧之前吐出它的尾部。
+// Chat 的 n>1 场景中每个 choice 必须使用独立缓存，否则不同 choice 的正文会串流。
+func flushFinishedChatChoices(guard *streamWriteGuard, restorers map[chatRestoreKey]*identityRestorer, chunk map[string]any) {
+	choices, _ := chunk["choices"].([]any)
+	for _, c := range choices {
+		choice, ok := c.(map[string]any)
+		if !ok || strOf(choice["finish_reason"]) == "" {
+			continue
+		}
+		choiceIndex := intFloat(choice["index"])
+		for _, channel := range []string{"content", "reasoning_content"} {
+			key := chatRestoreKeyFor(choiceIndex, channel)
+			if restorer := restorers[key]; restorer != nil {
+				if tail := restorer.Flush(); tail != "" {
+					guard.writeData(tailChunkJSON(choiceIndex, channel, tail))
+				}
+			}
+		}
+	}
+}
+
+// flushAllChatRestorers 处理没有 finish_reason 但正常 EOF 的边界情况，以及
+// finish_reason 之后才出现的尾部。正常路径应在终止帧前调用上面的函数。
+func flushAllChatRestorers(guard *streamWriteGuard, restorers map[chatRestoreKey]*identityRestorer) {
+	for key, restorer := range restorers {
+		if tail := restorer.Flush(); tail != "" {
+			guard.writeData(tailChunkJSON(key.choice, key.channel, tail))
+		}
+	}
+}
+
+// tailChunkJSON 把收尾时补发的尾部包装成最小的 Chat 分片。
+func tailChunkJSON(choiceIndex int, channel, text string) string {
+	payload, err := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{"index": choiceIndex, "delta": map[string]any{channel: text}, "finish_reason": nil}},
+	})
+	if err != nil {
+		return ""
+	}
+	return string(payload)
+}
+
+// restoreChatCompletionIdentity 对本地聚合出的 Chat 回复做身份还原。
+// 只处理 message.content 与 message.reasoning_content 两个可见文本通道；
+// 工具调用、角色、用量和分片结构保持原样。未开启还原时原样返回输入字节。
+func restoreChatCompletionIdentity(r *http.Request, completionJSON []byte) []byte {
+	plan := identityRestoreFor(r)
+	if !plan.active() {
+		return completionJSON
+	}
+	var completion map[string]any
+	if json.Unmarshal(completionJSON, &completion) != nil {
+		return completionJSON
+	}
+	choices, _ := completion["choices"].([]any)
+	changed := false
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choice["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, channel := range []string{"content", "reasoning_content"} {
+			text, ok := message[channel].(string)
+			if !ok || text == "" {
+				continue
+			}
+			if next := restoreIdentityText(plan.rules, text); next != text {
+				message[channel] = next
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return completionJSON
+	}
+	out, err := json.Marshal(completion)
+	if err != nil {
+		return completionJSON
+	}
+	return out
+}
+
 func cleanChunkJSON(s string) string {
+	return cleanChunkObject(s, identityRestore{}, nil)
+}
+
+// cleanChunkObject 清洗单个 Chat 分片，并对正文与推理正文两个通道做身份还原。
+// restorers 由流式调用方跨分片复用；工具参数、角色和元数据不参与还原。
+func cleanChunkObject(s string, plan identityRestore, restorers map[chatRestoreKey]*identityRestorer) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {
 		return s
@@ -6710,6 +7008,25 @@ func cleanChunkJSON(s string) string {
 				choice["finish_reason"] = nil
 			}
 			if delta, ok := choice["delta"].(map[string]any); ok {
+				// 工具增量的身份字段可省略；空值表示本片没有更新。
+				// 保留 index、参数片段和扩展字段，供客户端完整累计。
+				calls, _ := delta["tool_calls"].([]any)
+				for _, raw := range calls {
+					call, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					for _, key := range []string{"id", "type"} {
+						if value, ok := call[key].(string); ok && value == "" {
+							delete(call, key)
+						}
+					}
+					if function, ok := call["function"].(map[string]any); ok {
+						if name, ok := function["name"].(string); ok && name == "" {
+							delete(function, "name")
+						}
+					}
+				}
 				for k, v := range delta {
 					if k == "function_call" && isEmptyFunctionCall(v) {
 						delete(delta, k)
@@ -6717,6 +7034,26 @@ func cleanChunkJSON(s string) string {
 					}
 					if isEmptyValue(v) {
 						delete(delta, k)
+					}
+				}
+				if plan.active() {
+					for _, channel := range []string{"content", "reasoning_content"} {
+						text, ok := delta[channel].(string)
+						if !ok || text == "" {
+							continue
+						}
+						key := chatRestoreKeyFor(intFloat(choice["index"]), channel)
+						restorer := restorers[key]
+						if restorer == nil {
+							restorer = newIdentityRestorer(plan)
+							restorers[key] = restorer
+						}
+						next := restorer.Write(text)
+						if next == "" {
+							delete(delta, channel)
+						} else if next != text {
+							delta[channel] = next
+						}
 					}
 				}
 			}
