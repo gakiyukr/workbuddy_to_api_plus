@@ -129,6 +129,30 @@ func ensureRuntimeConfigFile(path string) error {
 		}
 		changed = changed || updated
 	}
+	if !hasKey(doc, "concurrent") {
+		doc["concurrent"], _ = json.Marshal(normalizeConcurrentConfig(concurrentFileConfig{}))
+		changed = true
+	} else {
+		for key, value := range doc {
+			if !strings.EqualFold(key, "concurrent") {
+				continue
+			}
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(value, &fields) != nil || fields == nil {
+				break
+			}
+			if !hasKey(fields, "MaxAcc") {
+				fields["MaxAcc"] = json.RawMessage("1")
+				changed = true
+			}
+			if !hasKey(fields, "MaxGlobal") {
+				fields["MaxGlobal"] = json.RawMessage("0")
+				changed = true
+			}
+			doc[key], _ = json.Marshal(fields)
+			break
+		}
+	}
 	if !changed {
 		return nil
 	}
@@ -160,7 +184,7 @@ func ensureRuntimeConfigFile(path string) error {
 	if err := os.Rename(temporary, path); err != nil {
 		return err
 	}
-	log.Printf("[配置初始化] 已补充缺失的 identity 默认配置；实验功能 identity.responseRestore 缺省补为 false，已有值和其他配置保留，后续修改仍可热加载")
+	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；实验功能 identity.responseRestore 缺省补为 false，已有值和其他配置保留，后续修改仍可热加载")
 	return nil
 }
 
@@ -339,6 +363,8 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
 	setIdentityConfig(c.Identity)
 	deprecatedPromptCompatibilityPresent.Store(len(c.DeprecatedPromptCompatibility) > 0)
+	modelConcurrency.configure(c.Concurrent)
+	logConcurrentConfig(trace)
 	logIdentityRuntimeConfig(trace)
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))
 	header, idle, retries := upstreamHeaderTimeoutDefault, upstreamIdleTimeoutDefault, upstreamTransientRetriesDefault

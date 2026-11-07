@@ -533,18 +533,6 @@ func TestIsAlreadyCheckedIn(t *testing.T) {
 	}
 }
 
-func TestNextDailyCheckinUTC8(t *testing.T) {
-	loc := time.FixedZone("test", 8*60*60)
-	before := time.Date(2026, 9, 15, 8, 59, 0, 0, loc)
-	if got := nextDailyCheckin(before); !got.Equal(time.Date(2026, 9, 15, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
-		t.Fatalf("before 09:00 got %v", got)
-	}
-	after := time.Date(2026, 9, 15, 9, 1, 0, 0, loc)
-	if got := nextDailyCheckin(after); !got.Equal(time.Date(2026, 9, 16, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
-		t.Fatalf("after 09:00 got %v", got)
-	}
-}
-
 func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

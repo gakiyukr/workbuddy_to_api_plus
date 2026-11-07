@@ -77,10 +77,9 @@ type runtimeFileConfig struct {
 	Identity runtimeIdentityConfig `json:"identity"`
 	// 仅接受 v1.14.40 曾写入的旧字段，避免升级时因未知字段无法启动。
 	// 不解析或执行其中规则；新的文本替换统一由 Identity 控制。
-	DeprecatedPromptCompatibility json.RawMessage `json:"promptCompatibility,omitempty"`
-	// 仅接受上游 v1.14.30+ 写入的并发配置；本 fork 未启用并发控制，保留原值不执行。
-	Concurrent json.RawMessage `json:"concurrent,omitempty"`
-	Debug      debugFileConfig `json:"debug"`
+	DeprecatedPromptCompatibility json.RawMessage      `json:"promptCompatibility,omitempty"`
+	Concurrent                    concurrentFileConfig `json:"concurrent"`
+	Debug                         debugFileConfig      `json:"debug"`
 	Logs  struct {
 		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
 	} `json:"logs"`

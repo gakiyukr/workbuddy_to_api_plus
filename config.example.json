@@ -32,6 +32,10 @@
       "You are(.*)released by xAI": "You are WorkBuddy"
     }
   },
+  "concurrent": {
+    "MaxAcc": 1,
+    "MaxGlobal": 0
+  },
   "debug": {
     "enabled": false,
     "fullRequests": false
